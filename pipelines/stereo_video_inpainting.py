@@ -5,15 +5,16 @@ from typing import Callable, Dict, List, Optional, Union
 import numpy as np
 import PIL.Image
 import torch
-from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
-
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.models import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
+from diffusers.models import (
+    AutoencoderKLTemporalDecoder,
+    UNetSpatioTemporalConditionModel,
+)
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.schedulers import EulerDiscreteScheduler
 from diffusers.utils import BaseOutput, logging
 from diffusers.utils.torch_utils import is_compiled_module, randn_tensor
-from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-
+from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
 logger = logging.get_logger(__name__)
 
@@ -136,7 +137,6 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
                 do_rescale=False,
                 return_tensors="pt",
             ).pixel_values
-            
 
         image = image.to(device=device, dtype=dtype)
         image_embeddings = self.image_encoder(image).image_embeds
@@ -179,7 +179,7 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         image_latents = image_latents.repeat(num_videos_per_prompt, 1, 1, 1)
 
         return image_latents
-    
+
     def _encode_vae_frames(
         self,
         frames: torch.Tensor,
@@ -189,14 +189,13 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         n_frames_per_time=5,
     ):
         frames = frames.to(device=device) # f c h w
-        
+
         # self.vae.to(device=device,dtype=torch.float16)
         latent_list = []
         for i in range(0,frames.shape[0],n_frames_per_time):
             frame_latent = self.vae.encode(frames[i:i+n_frames_per_time]).latent_dist.mode()
             latent_list.append(frame_latent)
         frame_latents = torch.cat(latent_list,dim=0).unsqueeze(0)
-        
 
         if do_classifier_free_guidance:
             negative_frame_latents = torch.zeros_like(frame_latents)
@@ -222,14 +221,13 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         frames_mask = frames_mask.to(device=device)
         frames_mask= torch.nn.functional.interpolate(frames_mask,scale_factor=1/self.vae_scale_factor)
         frames_mask =frames_mask.unsqueeze(0)
-        
+
         if do_classifier_free_guidance:
             negative_frames_mask = torch.zeros_like(frames_mask)
             frames_mask = torch.cat([negative_frames_mask,frames_mask])
-        
+
         frames_mask = frames_mask.repeat(num_videos_per_prompt,1,1,1,1)
         return frames_mask
-
 
     def _get_add_time_ids(
         self,
@@ -441,7 +439,7 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         from diffusers import StableVideoDiffusionPipeline
         from diffusers.utils import load_image, export_to_video
 
-        pipe = StableVideoDiffusionPipeline.from_pretrained("stabilityai/stable-video-diffusion-img2vid-xt", torch_dtype=torch.float16, variant="fp16")
+        pipe = StableVideoDiffusionPipeline.from_pretrained("stabilityai/stable-video-diffusion-img2vid-xt", dtype=torch.float16, variant="fp16")
         pipe.to("cuda")
 
         image = load_image("https://lh3.googleusercontent.com/y-iFOHfLTwkuQSUegpwDdgKmOjRSTvPxat63dQLB25xkTs4lhIbRUFeNBWZzYf370g=s1200")
@@ -488,17 +486,16 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         frames = self.image_processor.preprocess(frames, height=height, width=width)
         noise = randn_tensor(frames.shape, generator=generator, device=frames.device, dtype=frames.dtype)
         frames = frames + noise_aug_strength * noise
-        
+
         frames_mask = self.mask_processor.preprocess(frames_mask, height=height,width=width)
 
         needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
         if needs_upcasting:
             self.vae.to(dtype=torch.float32)
 
-
         frame_latents = self._encode_vae_frames(frames, device, num_videos_per_prompt, self.do_classifier_free_guidance)
         frame_latents = frame_latents.to(image_embeddings.dtype)
-        
+
         mask_latents = self._encode_mask_frames(frames_mask,device, num_videos_per_prompt, self.do_classifier_free_guidance)
         mask_latents = mask_latents.to(image_embeddings.dtype)
 

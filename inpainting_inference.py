@@ -1,18 +1,16 @@
 import os
+
 import cv2
 import numpy as np
-from fire import Fire
-
 import torch
 from decord import VideoReader, cpu
-
-from transformers import CLIPVisionModelWithProjection
-from diffusers import (
-    AutoencoderKLTemporalDecoder,
+from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
+from fire import Fire
+from pipelines.stereo_video_inpainting import (
+    StableVideoDiffusionInpaintingPipeline,
+    tensor2vid,
 )
-from diffusers import UNetSpatioTemporalConditionModel
-
-from pipelines.stereo_video_inpainting import StableVideoDiffusionInpaintingPipeline, tensor2vid
+from transformers import CLIPVisionModelWithProjection
 
 
 def blend_h(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor:
@@ -48,14 +46,11 @@ def spatial_tiled_process(
 
     tile_overlap = (128, 128)
     tile_size = (
-        int((height + tile_overlap[0] *  (tile_num - 1)) / tile_num), 
-        int((width  + tile_overlap[1] * (tile_num - 1)) / tile_num)
+        int((height + tile_overlap[0] * (tile_num - 1)) / tile_num),
+        int((width + tile_overlap[1] * (tile_num - 1)) / tile_num),
     )
-    tile_stride = (
-        (tile_size[0] - tile_overlap[0]), 
-        (tile_size[1] - tile_overlap[1])
-        )
-    
+    tile_stride = ((tile_size[0] - tile_overlap[0]), (tile_size[1] - tile_overlap[1]))
+
     cols = []
     for i in range(0, tile_num):
         rows = []
@@ -126,17 +121,13 @@ def write_video_opencv(input_frames, fps, output_video_path):
     height, width, _ = input_frames[0].shape
 
     out = cv2.VideoWriter(
-        output_video_path, 
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps, 
-        (width, height)
+        output_video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
     )
 
     for i in range(num_frames):
         out.write(input_frames[i, :, :, ::-1])
 
     out.release()
-
 
 
 def main(
@@ -148,19 +139,13 @@ def main(
     overlap=3,
     tile_num=1
 ):
-    
+
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-        pre_trained_path,
-        subfolder="image_encoder",
-        variant="fp16",
-        torch_dtype=torch.float16
+        pre_trained_path, subfolder="image_encoder", variant="fp16", dtype=torch.float16
     )
 
     vae = AutoencoderKLTemporalDecoder.from_pretrained(
-        pre_trained_path, 
-        subfolder="vae", 
-        variant="fp16", 
-        torch_dtype=torch.float16
+        pre_trained_path, subfolder="vae", variant="fp16", dtype=torch.float16
     )
 
     unet = UNetSpatioTemporalConditionModel.from_pretrained(
@@ -168,7 +153,7 @@ def main(
         subfolder="unet_diffusers",
         low_cpu_mem_usage=True,
         # variant="fp16",
-        torch_dtype=torch.float16
+        dtype=torch.float16,
     )
 
     image_encoder.requires_grad_(False)
@@ -180,7 +165,7 @@ def main(
         image_encoder=image_encoder,
         vae=vae,
         unet=unet,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
     )
     pipeline = pipeline.to("cuda")
 
@@ -194,9 +179,7 @@ def main(
     num_frames = len(video_reader)
 
     # [t,h,w,c] -> [t,c,h,w]
-    frames = (
-        torch.tensor(frames.asnumpy()).permute(0, 3, 1, 2).float()
-    )  
+    frames = torch.tensor(frames.asnumpy()).permute(0, 3, 1, 2).float()
 
     height, width = frames.shape[2] // 2, frames.shape[3] // 2
     frames_left = frames[:, :, :height, :width]
@@ -274,12 +257,10 @@ def main(
 
     frames_output = torch.cat(results, dim=0).cpu()
 
-
     frames_sbs = torch.cat([frames_left, frames_output], dim=3)
     frames_sbs_path = os.path.join(save_dir, f"{video_name}_sbs.mp4")
     frames_sbs = (frames_sbs * 255).permute(0, 2, 3, 1).to(dtype=torch.uint8).cpu().numpy()
     write_video_opencv(frames_sbs, fps, frames_sbs_path)
-
 
     vid_left = (frames_left * 255).permute(0, 2, 3, 1).to(dtype=torch.uint8).cpu().numpy()
     vid_right = (frames_output * 255).permute(0, 2, 3, 1).to(dtype=torch.uint8).cpu().numpy()

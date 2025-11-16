@@ -1,21 +1,21 @@
 import gc
-import cv2
 import os
+
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.io import write_video
-
+from decord import VideoReader, cpu
+from dependency.DepthCrafter.depthcrafter.depth_crafter_ppl import DepthCrafterPipeline
+from dependency.DepthCrafter.depthcrafter.unet import (
+    DiffusersUNetSpatioTemporalConditionModelDepthCrafter,
+)
+from dependency.DepthCrafter.depthcrafter.utils import vis_sequence_depth
 from diffusers.training_utils import set_seed
 from fire import Fire
-from decord import VideoReader, cpu
-
-from dependency.DepthCrafter.depthcrafter.depth_crafter_ppl import DepthCrafterPipeline
-from dependency.DepthCrafter.depthcrafter.unet import DiffusersUNetSpatioTemporalConditionModelDepthCrafter
-from dependency.DepthCrafter.depthcrafter.utils import vis_sequence_depth
-
 from Forward_Warp import forward_warp
+from torchvision.io import write_video
 
 
 def read_video_frames(video_path, process_length, target_fps, max_res, dataset="open"):
@@ -63,13 +63,13 @@ class DepthCrafterDemo:
         unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
             unet_path,
             low_cpu_mem_usage=True,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         )
         # load weights of other components from the provided checkpoint
         self.pipe = DepthCrafterPipeline.from_pretrained(
             pre_trained_path,
             unet=unet,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             variant="fp16",
         )
 
@@ -139,7 +139,7 @@ class DepthCrafterDemo:
         tensor_res = torch.tensor(res).unsqueeze(1).float().contiguous().cuda()
         res = F.interpolate(tensor_res, size=(original_height, original_width), mode='bilinear', align_corners=False)
         res = res.cpu().numpy()[:,0,:,:]
-        
+
         # normalize the depth map to [0, 1] across the whole video
         res = (res - res.min()) / (res.max() - res.min())
         # visualize the depth map and save the results
@@ -155,7 +155,7 @@ class DepthCrafterDemo:
             write_video(save_path + "_depth_vis.mp4", vis*255.0, fps=target_fps, video_codec="h264", options={"crf": "16"})
 
         return res, vis
-    
+
 
 class ForwardWarpStereo(nn.Module):
     def __init__(self, eps=1e-6, occlu_map=False):
@@ -194,17 +194,18 @@ class ForwardWarpStereo(nn.Module):
             occlu_map.clamp_(0.0, 1.0)
             occlu_map = 1.0 - occlu_map
             return res, occlu_map
-        
+
 
 def DepthSplatting(
-        input_video_path, 
-        output_video_path, 
-        video_depth, 
-        depth_vis, 
-        max_disp, 
-        process_length, 
-        batch_size):
-    '''
+    input_video_path,
+    output_video_path,
+    video_depth,
+    depth_vis,
+    max_disp,
+    process_length,
+    batch_size,
+):
+    """
     Depth-Based Video Splatting Using the Video Depth.
     Args:
         input_video_path: Path to the input video.
@@ -212,8 +213,8 @@ def DepthSplatting(
         video_depth: Video depth with shape of [T, H, W] in [0, 1].
         depth_vis: Visualized video depth with shape of [T, H, W, 3] in [0, 1].
         process_length: The length of video to process.
-        batch_size: The batch size for splatting to save GPU memory. 
-    '''
+        batch_size: The batch size for splatting to save GPU memory.
+    """
     vid_reader = VideoReader(input_video_path, ctx=cpu(0))
     original_fps = vid_reader.get_avg_fps()
     input_frames = vid_reader[:].asnumpy() / 255.0
@@ -230,10 +231,10 @@ def DepthSplatting(
 
     # Initialize OpenCV VideoWriter
     out = cv2.VideoWriter(
-        output_video_path, 
+        output_video_path,
         cv2.VideoWriter_fourcc(*"mp4v"),
-        original_fps, 
-        (width * 2, height * 2)
+        original_fps,
+        (width * 2, height * 2),
     )
 
     for i in range(0, num_frames, batch_size):
@@ -291,13 +292,13 @@ def main(
     )
 
     DepthSplatting(
-        input_video_path, 
-        output_video_path, 
-        video_depth, 
+        input_video_path,
+        output_video_path,
+        video_depth,
         depth_vis,
         max_disp,
-        process_length, 
-        batch_size
+        process_length,
+        batch_size,
     )
 
 
