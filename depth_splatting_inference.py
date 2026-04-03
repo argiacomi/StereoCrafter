@@ -25,16 +25,51 @@ torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("medium")
 
 
-def from_pretrained_with_dtype_compat(cls, *args, dtype=None, **kwargs):
+def from_pretrained_with_dtype_compat(
+    cls, *args, dtype=None, prefer_torch_dtype=False, **kwargs
+):
     if dtype is None:
         return cls.from_pretrained(*args, **kwargs)
 
-    try:
-        return cls.from_pretrained(*args, dtype=dtype, **kwargs)
-    except TypeError as exc:
-        if "unexpected keyword argument 'dtype'" not in str(exc):
-            raise
-        return cls.from_pretrained(*args, torch_dtype=dtype, **kwargs)
+    dtype_kwargs = (
+        ({"torch_dtype": dtype}, {"dtype": dtype})
+        if prefer_torch_dtype
+        else ({"dtype": dtype}, {"torch_dtype": dtype})
+    )
+
+    last_exc = None
+    for dtype_kwarg in dtype_kwargs:
+        try:
+            return cls.from_pretrained(*args, **dtype_kwarg, **kwargs)
+        except TypeError as exc:
+            if not any(
+                f"unexpected keyword argument '{key}'" in str(exc)
+                for key in dtype_kwarg
+            ):
+                raise
+            last_exc = exc
+
+    if last_exc is not None:
+        raise last_exc
+
+    raise RuntimeError("Failed to load model with either dtype or torch_dtype.")
+
+
+def is_torch_compile_failure(exc):
+    needles = (
+        "torch._dynamo",
+        "Dynamo failed",
+        "TorchRuntimeError",
+        "fake tensors",
+        "BackendCompilerFailed",
+    )
+    current = exc
+    while current is not None:
+        message = str(current)
+        if any(needle in message for needle in needles):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def build_video_plan(video_path, process_length, target_fps, max_res, dataset="open"):
@@ -170,13 +205,18 @@ class DepthCrafterDemo:
             pre_trained_path,
             unet=unet,
             dtype=torch.float16,
+            prefer_torch_dtype=True,
             variant="fp16",
         )
+        self.pipe = self.pipe.to(dtype=torch.float16)
+        self._eager_unet = self.pipe.unet
+        self._compiled_unet = False
 
         if cpu_offload is None:
             self.pipe.to("cuda")
             # Only compile when fully on GPU — offload moves modules dynamically
             self.pipe.unet = torch.compile(self.pipe.unet, mode="max-autotune")
+            self._compiled_unet = True
         elif cpu_offload == "sequential":
             self.pipe.enable_sequential_cpu_offload()
         elif cpu_offload == "model":
@@ -245,17 +285,39 @@ class DepthCrafterDemo:
             )
 
             with torch.inference_mode():
-                chunk_depth = self.pipe(
-                    frames,
-                    height=frames.shape[1],
-                    width=frames.shape[2],
-                    output_type="np",
-                    guidance_scale=guidance_scale,
-                    num_inference_steps=num_denoising_steps,
-                    window_size=window_size,
-                    overlap=overlap,
-                    track_time=track_time,
-                ).frames[0]
+                try:
+                    chunk_depth = self.pipe(
+                        frames,
+                        height=frames.shape[1],
+                        width=frames.shape[2],
+                        output_type="np",
+                        guidance_scale=guidance_scale,
+                        num_inference_steps=num_denoising_steps,
+                        window_size=window_size,
+                        overlap=overlap,
+                        track_time=track_time,
+                    ).frames[0]
+                except Exception as exc:
+                    if not (self._compiled_unet and is_torch_compile_failure(exc)):
+                        raise
+
+                    print(
+                        "torch.compile failed for the DepthCrafter UNet; "
+                        "falling back to eager execution."
+                    )
+                    self.pipe.unet = self._eager_unet
+                    self._compiled_unet = False
+                    chunk_depth = self.pipe(
+                        frames,
+                        height=frames.shape[1],
+                        width=frames.shape[2],
+                        output_type="np",
+                        guidance_scale=guidance_scale,
+                        num_inference_steps=num_denoising_steps,
+                        window_size=window_size,
+                        overlap=overlap,
+                        track_time=track_time,
+                    ).frames[0]
 
             chunk_depth = chunk_depth.sum(-1) / chunk_depth.shape[-1]
             chunk_depth = resize_depth_to_original(
