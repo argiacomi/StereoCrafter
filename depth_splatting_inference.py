@@ -25,6 +25,18 @@ torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("medium")
 
 
+def from_pretrained_with_dtype_compat(cls, *args, dtype=None, **kwargs):
+    if dtype is None:
+        return cls.from_pretrained(*args, **kwargs)
+
+    try:
+        return cls.from_pretrained(*args, dtype=dtype, **kwargs)
+    except TypeError as exc:
+        if "unexpected keyword argument 'dtype'" not in str(exc):
+            raise
+        return cls.from_pretrained(*args, torch_dtype=dtype, **kwargs)
+
+
 def build_video_plan(video_path, process_length, target_fps, max_res, dataset="open"):
     if dataset == "open":
         print("==> processing video: ", video_path)
@@ -146,13 +158,15 @@ class DepthCrafterDemo:
         pre_trained_path: str,
         cpu_offload: str = None,
     ):
-        unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
+        unet = from_pretrained_with_dtype_compat(
+            DiffusersUNetSpatioTemporalConditionModelDepthCrafter,
             unet_path,
             low_cpu_mem_usage=True,
             dtype=torch.float16,
         )
         # load weights of other components from the provided checkpoint
-        self.pipe = DepthCrafterPipeline.from_pretrained(
+        self.pipe = from_pretrained_with_dtype_compat(
+            DepthCrafterPipeline,
             pre_trained_path,
             unet=unet,
             dtype=torch.float16,
