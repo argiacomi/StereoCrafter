@@ -1,4 +1,6 @@
 import os
+import shutil
+import tempfile
 
 import cv2
 import numpy as np
@@ -22,7 +24,7 @@ torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("medium")
 
 
-def read_video_frames(video_path, process_length, target_fps, max_res, dataset="open"):
+def build_video_plan(video_path, process_length, target_fps, max_res, dataset="open"):
     if dataset == "open":
         print("==> processing video: ", video_path)
         vid = VideoReader(video_path, ctx=cpu(0))
@@ -53,9 +55,39 @@ def read_video_frames(video_path, process_length, target_fps, max_res, dataset="
     print(
         f"==> final processing shape: {(len(frames_idx), resized_height, resized_width, 3)}"
     )
-    frames = vid.get_batch(frames_idx).asnumpy().astype("float32") / 255.0
 
-    return frames, fps, original_height, original_width
+    return {
+        "video_path": video_path,
+        "frame_indices": frames_idx,
+        "fps": fps,
+        "original_height": original_height,
+        "original_width": original_width,
+        "resized_height": resized_height,
+        "resized_width": resized_width,
+    }
+
+
+def iter_window_ranges(total_frames, chunk_size, overlap):
+    if chunk_size <= overlap:
+        raise ValueError(
+            f"`chunk_size` must be larger than `overlap`, but got {chunk_size=} and {overlap=}."
+        )
+
+    step = chunk_size - overlap
+    for start in range(0, total_frames, step):
+        stop = min(start + chunk_size, total_frames)
+        keep_from = 0 if start == 0 else overlap
+        write_start = start + keep_from
+        if write_start >= stop:
+            continue
+        yield start, stop, keep_from, write_start
+        if stop == total_frames:
+            break
+
+
+def iter_batch_ranges(total_frames, batch_size):
+    for start in range(0, total_frames, batch_size):
+        yield start, min(start + batch_size, total_frames)
 
 
 def write_video_opencv(input_frames, fps, output_video_path):
@@ -73,6 +105,37 @@ def write_video_opencv(input_frames, fps, output_video_path):
         out.write(input_frames[i, :, :, ::-1])
 
     out.release()
+
+
+def create_video_writer(output_video_path, fps, width, height):
+    return cv2.VideoWriter(
+        output_video_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height),
+    )
+
+
+def resize_depth_to_original(depth_chunk, original_height, original_width, device):
+    resized_chunks = []
+    resize_batch_size = 64
+    for start, stop in iter_batch_ranges(len(depth_chunk), resize_batch_size):
+        chunk = torch.from_numpy(depth_chunk[start:stop]).unsqueeze(1).to(
+            device=device, dtype=torch.float32
+        )
+        chunk = F.interpolate(
+            chunk,
+            size=(original_height, original_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        resized_chunks.append(chunk[:, 0].cpu().numpy())
+    return np.concatenate(resized_chunks, axis=0)
+
+
+def normalize_depth_batch(depth_batch, depth_min, depth_max):
+    denom = max(depth_max - depth_min, 1e-6)
+    return np.clip((depth_batch - depth_min) / denom, 0.0, 1.0).astype(np.float32)
 
 
 class DepthCrafterDemo:
@@ -117,72 +180,134 @@ class DepthCrafterDemo:
 
     def infer(
         self,
-        input_video_path: str,
+        video_plan,
         output_video_path: str,
-        process_length: int = -1,
+        scratch_dir: str,
         num_denoising_steps: int = 8,
         guidance_scale: float = 1.2,
         window_size: int = 70,
         overlap: int = 25,
-        max_res: int = 1024,
-        dataset: str = "open",
-        target_fps: int = -1,
         seed: int = 42,
         track_time: bool = False,
         save_depth: bool = False,
     ):
         set_seed(seed)
-
-        frames, target_fps, original_height, original_width = read_video_frames(
-            input_video_path,
-            process_length,
-            target_fps,
-            max_res,
-            dataset,
-        )
-
-        # inference the depth map using the DepthCrafter pipeline
-        with torch.inference_mode():
-            res = self.pipe(
-                frames,
-                height=frames.shape[1],
-                width=frames.shape[2],
-                output_type="np",
-                guidance_scale=guidance_scale,
-                num_inference_steps=num_denoising_steps,
-                window_size=window_size,
-                overlap=overlap,
-                track_time=track_time,
-            ).frames[0]
-
-        # convert the three-channel output to a single channel depth map
-        res = res.sum(-1) / res.shape[-1]
-
-        # resize the depth to the original size (chunk to limit peak VRAM)
-        res_chunks = []
-        chunk_size = 64
-        for ci in range(0, len(res), chunk_size):
-            chunk = torch.from_numpy(res[ci:ci+chunk_size]).unsqueeze(1).float().cuda()
-            chunk = F.interpolate(chunk, size=(original_height, original_width), mode='bilinear', align_corners=False)
-            res_chunks.append(chunk[:, 0].cpu().numpy())
-        res = np.concatenate(res_chunks, axis=0)
-
-        # normalize the depth map to [0, 1] across the whole video
-        res = (res - res.min()) / (res.max() - res.min())
-        # visualize the depth map and save the results
-        vis = vis_sequence_depth(res)
-        # save the depth map and visualization with the target FPS
+        num_frames = len(video_plan["frame_indices"])
+        original_height = video_plan["original_height"]
+        original_width = video_plan["original_width"]
+        resized_height = video_plan["resized_height"]
+        resized_width = video_plan["resized_width"]
+        target_fps = video_plan["fps"]
         save_path = os.path.join(
             os.path.dirname(output_video_path), os.path.splitext(os.path.basename(output_video_path))[0]
         )
 
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        if save_depth:
-            np.savez_compressed(save_path + ".npz", depth=res)
-            depth_vis = np.clip(vis * 255.0, 0, 255).astype(np.uint8)
-            write_video_opencv(depth_vis, target_fps, save_path + "_depth_vis.mp4")
+        raw_depth_path = os.path.join(scratch_dir, "depth_raw.npy")
+        raw_depth = np.lib.format.open_memmap(
+            raw_depth_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(num_frames, original_height, original_width),
+        )
 
-        return res, vis
+        resized_reader = VideoReader(
+            video_plan["video_path"],
+            ctx=cpu(0),
+            width=resized_width,
+            height=resized_height,
+        )
+        device = self.pipe._execution_device
+        chunk_size = max(window_size, overlap + 1)
+
+        for start, stop, keep_from, write_start in iter_window_ranges(
+            num_frames, chunk_size, overlap
+        ):
+            chunk_indices = video_plan["frame_indices"][start:stop]
+            frames = (
+                resized_reader.get_batch(chunk_indices).asnumpy().astype(np.float32) / 255.0
+            )
+
+            with torch.inference_mode():
+                chunk_depth = self.pipe(
+                    frames,
+                    height=frames.shape[1],
+                    width=frames.shape[2],
+                    output_type="np",
+                    guidance_scale=guidance_scale,
+                    num_inference_steps=num_denoising_steps,
+                    window_size=window_size,
+                    overlap=overlap,
+                    track_time=track_time,
+                ).frames[0]
+
+            chunk_depth = chunk_depth.sum(-1) / chunk_depth.shape[-1]
+            chunk_depth = resize_depth_to_original(
+                chunk_depth, original_height, original_width, device
+            )
+
+            # Blend overlap region with previously written depth to avoid
+            # hard temporal cuts between independently-processed chunks.
+            if keep_from > 0:
+                overlap_new = chunk_depth[:keep_from]
+                overlap_old = np.array(raw_depth[start : start + keep_from])
+                weights = np.linspace(1.0, 0.0, keep_from, dtype=np.float32)[
+                    :, None, None
+                ]
+                blended = overlap_old * weights + overlap_new * (1.0 - weights)
+                raw_depth[start : start + keep_from] = blended
+
+            unique_depth = chunk_depth[keep_from:]
+            write_stop = write_start + len(unique_depth)
+            raw_depth[write_start:write_stop] = unique_depth
+
+        del raw_depth
+
+        # Compute min/max from the finalized memmap so blended overlap
+        # regions are included and no stale pre-blend extrema leak through.
+        raw_depth = np.load(raw_depth_path, mmap_mode="r+")
+        depth_min = np.inf
+        depth_max = -np.inf
+        for start, stop in iter_batch_ranges(num_frames, 64):
+            batch = raw_depth[start:stop]
+            depth_min = min(depth_min, float(batch.min()))
+            depth_max = max(depth_max, float(batch.max()))
+
+        depth_vis_writer = None
+        if save_depth:
+            depth_vis_writer = create_video_writer(
+                save_path + "_depth_vis.mp4",
+                target_fps,
+                original_width,
+                original_height,
+            )
+
+        for start, stop in iter_batch_ranges(num_frames, 64):
+            normalized_batch = normalize_depth_batch(
+                raw_depth[start:stop], depth_min, depth_max
+            )
+            raw_depth[start:stop] = normalized_batch
+
+            if depth_vis_writer is not None:
+                depth_vis = np.clip(
+                    vis_sequence_depth(normalized_batch) * 255.0, 0, 255
+                ).astype(np.uint8)
+                for frame in depth_vis:
+                    depth_vis_writer.write(frame[:, :, ::-1])
+
+        if depth_vis_writer is not None:
+            depth_vis_writer.release()
+
+        del raw_depth
+
+        if save_depth:
+            shutil.copy2(raw_depth_path, save_path + "_depth.npy")
+
+        return {
+            "depth_path": raw_depth_path,
+            "num_frames": num_frames,
+            "height": original_height,
+            "width": original_width,
+        }
 
 
 class ForwardWarpStereo(nn.Module):
@@ -225,51 +350,46 @@ class ForwardWarpStereo(nn.Module):
 
 
 def DepthSplatting(
-    input_video_path,
+    video_plan,
     output_video_path,
-    video_depth,
-    depth_vis,
+    depth_result,
     max_disp,
-    process_length,
     batch_size,
 ):
     """
     Depth-Based Video Splatting Using the Video Depth.
     Args:
-        input_video_path: Path to the input video.
+        video_plan: Processed video sampling plan.
         output_video_path: Path to the output video.
-        video_depth: Video depth with shape of [T, H, W] in [0, 1].
-        depth_vis: Visualized video depth with shape of [T, H, W, 3] in [0, 1].
-        process_length: The length of video to process.
+        depth_result: Streamed normalized depth metadata.
         batch_size: The batch size for splatting to save GPU memory.
     """
-    vid_reader = VideoReader(input_video_path, ctx=cpu(0))
-    original_fps = vid_reader.get_avg_fps()
-    input_frames = vid_reader[:].asnumpy().astype(np.float32) / 255.0
-
-    if process_length != -1 and process_length < len(input_frames):
-        input_frames = input_frames[:process_length]
-        video_depth = video_depth[:process_length]
-        depth_vis = depth_vis[:process_length]
+    vid_reader = VideoReader(video_plan["video_path"], ctx=cpu(0))
+    video_depth = np.load(depth_result["depth_path"], mmap_mode="r")
 
     stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
     stereo_projector = torch.compile(stereo_projector, mode="max-autotune")
 
-    num_frames = len(input_frames)
-    height, width, _ = input_frames[0].shape
+    num_frames = depth_result["num_frames"]
+    height = depth_result["height"]
+    width = depth_result["width"]
 
     # Initialize OpenCV VideoWriter
     out = cv2.VideoWriter(
         output_video_path,
         cv2.VideoWriter_fourcc(*"mp4v"),
-        original_fps,
+        video_plan["fps"],
         (width * 2, height * 2),
     )
 
     with torch.inference_mode():
         for i in range(0, num_frames, batch_size):
-            batch_frames = input_frames[i:i+batch_size]
-            batch_depth_vis = depth_vis[i:i+batch_size]
+            batch_indices = video_plan["frame_indices"][i : i + batch_size]
+            batch_frames = (
+                vid_reader.get_batch(batch_indices).asnumpy().astype(np.float32) / 255.0
+            )
+            batch_depth = np.asarray(video_depth[i : i + batch_size], dtype=np.float32)
+            batch_depth_vis = vis_sequence_depth(batch_depth)
 
             left_video = (
                 torch.from_numpy(batch_frames)
@@ -279,7 +399,7 @@ def DepthSplatting(
                 .cuda(non_blocking=True)
             )
             disp_map = (
-                torch.from_numpy(video_depth[i:i+batch_size])
+                torch.from_numpy(batch_depth)
                 .float()
                 .unsqueeze(1)
                 .pin_memory()
@@ -314,31 +434,57 @@ def main(
     unet_path: str,
     pre_trained_path: str,
     max_disp: float = 20.0,
-    process_length = -1,
-    batch_size = 32,
+    process_length: int = -1,
+    batch_size: int = 32,
     cpu_offload: str = "model",
+    num_denoising_steps: int = 8,
+    guidance_scale: float = 1.2,
+    window_size: int = 70,
+    overlap: int = 25,
+    max_res: int = 1024,
+    dataset: str = "open",
+    target_fps: int = -1,
+    seed: int = 42,
+    track_time: bool = False,
+    save_depth: bool = False,
 ):
+    video_plan = build_video_plan(
+        input_video_path,
+        process_length,
+        target_fps,
+        max_res,
+        dataset,
+    )
+
     depthcrafter_demo = DepthCrafterDemo(
         unet_path=unet_path,
         pre_trained_path=pre_trained_path,
         cpu_offload=cpu_offload,
     )
 
-    video_depth, depth_vis = depthcrafter_demo.infer(
-        input_video_path,
-        output_video_path,
-        process_length
-    )
+    scratch_root = os.path.dirname(output_video_path) or "."
+    os.makedirs(scratch_root, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="stereocrafter_depth_", dir=scratch_root) as scratch_dir:
+        depth_result = depthcrafter_demo.infer(
+            video_plan,
+            output_video_path,
+            scratch_dir,
+            num_denoising_steps=num_denoising_steps,
+            guidance_scale=guidance_scale,
+            window_size=window_size,
+            overlap=overlap,
+            seed=seed,
+            track_time=track_time,
+            save_depth=save_depth,
+        )
 
-    DepthSplatting(
-        input_video_path,
-        output_video_path,
-        video_depth,
-        depth_vis,
-        max_disp,
-        process_length,
-        batch_size,
-    )
+        DepthSplatting(
+            video_plan,
+            output_video_path,
+            depth_result,
+            max_disp,
+            batch_size,
+        )
 
 
 if __name__ == "__main__":
