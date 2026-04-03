@@ -1,3 +1,4 @@
+import gc
 import os
 import shutil
 import sys
@@ -96,6 +97,24 @@ def mark_torch_compile_step_begin():
         torch.compiler, "cudagraph_mark_step_begin"
     ):
         torch.compiler.cudagraph_mark_step_begin()
+
+
+def is_cuda_oom(exc):
+    oom_types = tuple(
+        t
+        for t in (
+            getattr(torch, "OutOfMemoryError", None),
+            (
+                getattr(torch.cuda, "OutOfMemoryError", None)
+                if hasattr(torch, "cuda")
+                else None
+            ),
+        )
+        if t is not None
+    )
+    if oom_types and isinstance(exc, oom_types):
+        return True
+    return "out of memory" in str(exc).lower()
 
 
 def build_video_plan(video_path, process_length, target_fps, max_res, dataset="open"):
@@ -235,6 +254,14 @@ class DepthCrafterDemo:
             variant="fp16",
         )
         self.pipe = self.pipe.to(dtype=torch.float16)
+        if hasattr(self.pipe, "enable_vae_slicing"):
+            self.pipe.enable_vae_slicing()
+        elif hasattr(self.pipe.vae, "enable_slicing"):
+            self.pipe.vae.enable_slicing()
+        if hasattr(self.pipe, "enable_vae_tiling"):
+            self.pipe.enable_vae_tiling()
+        elif hasattr(self.pipe.vae, "enable_tiling"):
+            self.pipe.vae.enable_tiling()
         self._eager_unet = self.pipe.unet
         self._compiled_unet = False
 
@@ -266,6 +293,7 @@ class DepthCrafterDemo:
         guidance_scale: float = 1.2,
         window_size: int = 70,
         overlap: int = 25,
+        decode_chunk_size: int = 8,
         seed: int = 42,
         track_time: bool = False,
         save_depth: bool = False,
@@ -301,6 +329,7 @@ class DepthCrafterDemo:
         # Silence per-chunk denoising bars; show one outer progress bar instead
         self.pipe.set_progress_bar_config(disable=True)
         chunk_ranges = list(iter_window_ranges(num_frames, chunk_size, overlap))
+        current_decode_chunk_size = max(1, int(decode_chunk_size))
 
         for start, stop, keep_from, write_start in tqdm(
             chunk_ranges, desc="Depth estimation", unit="chunk"
@@ -311,41 +340,68 @@ class DepthCrafterDemo:
             )
 
             with torch.inference_mode():
-                if self._compiled_unet:
-                    mark_torch_compile_step_begin()
-                try:
-                    chunk_depth = self.pipe(
-                        frames,
-                        height=frames.shape[1],
-                        width=frames.shape[2],
-                        output_type="np",
-                        guidance_scale=guidance_scale,
-                        num_inference_steps=num_denoising_steps,
-                        window_size=window_size,
-                        overlap=overlap,
-                        track_time=track_time,
-                    ).frames[0]
-                except Exception as exc:
-                    if not (self._compiled_unet and is_torch_compile_failure(exc)):
-                        raise
+                while True:
+                    if self._compiled_unet:
+                        mark_torch_compile_step_begin()
+                    try:
+                        chunk_depth = self.pipe(
+                            frames,
+                            height=frames.shape[1],
+                            width=frames.shape[2],
+                            output_type="np",
+                            guidance_scale=guidance_scale,
+                            num_inference_steps=num_denoising_steps,
+                            window_size=window_size,
+                            overlap=overlap,
+                            decode_chunk_size=current_decode_chunk_size,
+                            track_time=track_time,
+                        ).frames[0]
+                        break
+                    except Exception as exc:
+                        if self._compiled_unet and is_torch_compile_failure(exc):
+                            print(
+                                "torch.compile failed for the DepthCrafter UNet; "
+                                "falling back to eager execution."
+                            )
+                            self.pipe.unet = self._eager_unet
+                            self._compiled_unet = False
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
 
-                    print(
-                        "torch.compile failed for the DepthCrafter UNet; "
-                        "falling back to eager execution."
-                    )
-                    self.pipe.unet = self._eager_unet
-                    self._compiled_unet = False
-                    chunk_depth = self.pipe(
-                        frames,
-                        height=frames.shape[1],
-                        width=frames.shape[2],
-                        output_type="np",
-                        guidance_scale=guidance_scale,
-                        num_inference_steps=num_denoising_steps,
-                        window_size=window_size,
-                        overlap=overlap,
-                        track_time=track_time,
-                    ).frames[0]
+                        if is_cuda_oom(exc):
+                            if self._compiled_unet:
+                                print(
+                                    "DepthCrafter hit CUDA OOM with a compiled UNet; "
+                                    "retrying in eager mode."
+                                )
+                                self.pipe.unet = self._eager_unet
+                                self._compiled_unet = False
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                continue
+
+                            if current_decode_chunk_size > 1:
+                                next_decode_chunk_size = max(
+                                    1, current_decode_chunk_size // 2
+                                )
+                                if next_decode_chunk_size == current_decode_chunk_size:
+                                    next_decode_chunk_size = (
+                                        current_decode_chunk_size - 1
+                                    )
+                                print(
+                                    "DepthCrafter hit CUDA OOM during VAE decode; "
+                                    f"retrying with decode_chunk_size={next_decode_chunk_size}."
+                                )
+                                current_decode_chunk_size = next_decode_chunk_size
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                continue
+
+                        raise
 
             chunk_depth = chunk_depth.sum(-1) / chunk_depth.shape[-1]
             chunk_depth = resize_depth_to_original(
@@ -549,6 +605,7 @@ def main(
     guidance_scale: float = 1.2,
     window_size: int = 70,
     overlap: int = 25,
+    decode_chunk_size: int = 4,
     max_res: int = 1024,
     dataset: str = "open",
     target_fps: int = -1,
@@ -581,6 +638,7 @@ def main(
             guidance_scale=guidance_scale,
             window_size=window_size,
             overlap=overlap,
+            decode_chunk_size=decode_chunk_size,
             seed=seed,
             track_time=track_time,
             save_depth=save_depth,
