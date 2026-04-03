@@ -27,7 +27,9 @@ from tqdm import tqdm
 
 # Performance flags for CUDA
 torch.backends.cudnn.benchmark = True
-torch.set_float32_matmul_precision("medium")
+
+if hasattr(torch.backends, "fp32_precision"):
+    torch.backends.fp32_precision = "ieee"
 
 if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
     torch.backends.cuda.matmul.fp32_precision = "tf32"
