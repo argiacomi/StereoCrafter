@@ -254,8 +254,8 @@ def main(
 
     if cpu_offload is None:
         pipeline = pipeline.to("cuda")
-        pipeline.unet = torch.compile(pipeline.unet, mode="max-autotune")
-        pipeline.vae.decoder = torch.compile(pipeline.vae.decoder, mode="max-autotune")
+        pipeline.unet = torch.compile(pipeline.unet, mode="default")
+        pipeline.vae.decoder = torch.compile(pipeline.vae.decoder, mode="default")
     elif cpu_offload == "sequential":
         pipeline.enable_sequential_cpu_offload()
     elif cpu_offload == "model":

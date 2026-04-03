@@ -322,7 +322,7 @@ class DepthCrafterDemo:
         if cpu_offload is None:
             self.pipe.to("cuda")
             # Only compile when fully on GPU — offload moves modules dynamically
-            self.pipe.unet = torch.compile(self.pipe.unet, mode="max-autotune")
+            self.pipe.unet = torch.compile(self.pipe.unet, mode="default")
             self._compiled_unet = True
         elif cpu_offload == "sequential":
             self.pipe.enable_sequential_cpu_offload()
@@ -699,7 +699,7 @@ def DepthSplatting(
 
     stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
     eager_stereo_projector = stereo_projector
-    stereo_projector = torch.compile(stereo_projector, mode="max-autotune")
+    stereo_projector = torch.compile(stereo_projector, mode="default")
     compiled_stereo_projector = True
 
     num_frames = depth_result["num_frames"]
