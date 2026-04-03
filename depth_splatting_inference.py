@@ -89,6 +89,13 @@ def is_torch_compile_failure(exc):
     return False
 
 
+def mark_torch_compile_step_begin():
+    if hasattr(torch, "compiler") and hasattr(
+        torch.compiler, "cudagraph_mark_step_begin"
+    ):
+        torch.compiler.cudagraph_mark_step_begin()
+
+
 def build_video_plan(video_path, process_length, target_fps, max_res, dataset="open"):
     if dataset == "open":
         print("==> processing video: ", video_path)
@@ -302,6 +309,8 @@ class DepthCrafterDemo:
             )
 
             with torch.inference_mode():
+                if self._compiled_unet:
+                    mark_torch_compile_step_begin()
                 try:
                     chunk_depth = self.pipe(
                         frames,
@@ -505,6 +514,7 @@ def DepthSplatting(
             disp_map = disp_map * 2.0 - 1.0
             disp_map = disp_map * max_disp
 
+            mark_torch_compile_step_begin()
             right_video, occlusion_mask = stereo_projector(left_video, disp_map)
 
             right_video = right_video.cpu().permute(0, 2, 3, 1).numpy()

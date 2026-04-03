@@ -28,6 +28,13 @@ else:
     torch.backends.cudnn.allow_tf32 = True
 
 
+def mark_torch_compile_step_begin():
+    if hasattr(torch, "compiler") and hasattr(
+        torch.compiler, "cudagraph_mark_step_begin"
+    ):
+        torch.compiler.cudagraph_mark_step_begin()
+
+
 def blend_h(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor:
     weight_b = (torch.arange(overlap_size).view(1, 1, 1, -1) / overlap_size).to(
         b.device
@@ -322,6 +329,8 @@ def main(
                             f"i: {i}, cur_i: {cur_i}, cur_overlap: {cur_overlap}, input_frames_i: {input_frames_i.shape}, generated_context: {generated_context.shape}"
                         )
 
+                if cpu_offload is None:
+                    mark_torch_compile_step_begin()
                 video_latents = spatial_tiled_process(
                     input_frames_i,
                     frames_mask,
@@ -346,6 +355,8 @@ def main(
                 elif pipeline.vae.dtype != video_latents.dtype:
                     pipeline.vae.to(dtype=video_latents.dtype)
 
+                if cpu_offload is None:
+                    mark_torch_compile_step_begin()
                 video_frames = pipeline.decode_latents(
                     video_latents,
                     num_frames=video_latents.shape[1],
