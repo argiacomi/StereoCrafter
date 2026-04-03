@@ -13,9 +13,19 @@ from pipelines.stereo_video_inpainting import (
 from transformers import CLIPVisionModelWithProjection
 
 torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("medium")
+
+if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
+    torch.backends.cuda.matmul.fp32_precision = "tf32"
+else:
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+if hasattr(torch.backends.cudnn, "conv") and hasattr(
+    torch.backends.cudnn.conv, "fp32_precision"
+):
+    torch.backends.cudnn.conv.fp32_precision = "tf32"
+else:
+    torch.backends.cudnn.allow_tf32 = True
 
 
 def blend_h(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor:

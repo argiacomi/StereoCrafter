@@ -1,6 +1,8 @@
 import os
 import shutil
+import sys
 import tempfile
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -15,14 +17,29 @@ from dependency.DepthCrafter.depthcrafter.unet import (
 from dependency.DepthCrafter.depthcrafter.utils import vis_sequence_depth
 from diffusers.training_utils import set_seed
 from fire import Fire
+
+FORWARD_WARP_ROOT = Path(__file__).resolve().parent / "dependency" / "Forward-Warp"
+if FORWARD_WARP_ROOT.is_dir() and str(FORWARD_WARP_ROOT) not in sys.path:
+    sys.path.insert(0, str(FORWARD_WARP_ROOT))
+
 from Forward_Warp import forward_warp
 from tqdm import tqdm
 
 # Performance flags for CUDA
 torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("medium")
+
+if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
+    torch.backends.cuda.matmul.fp32_precision = "tf32"
+else:
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+if hasattr(torch.backends.cudnn, "conv") and hasattr(
+    torch.backends.cudnn.conv, "fp32_precision"
+):
+    torch.backends.cudnn.conv.fp32_precision = "tf32"
+else:
+    torch.backends.cudnn.allow_tf32 = True
 
 
 def from_pretrained_with_dtype_compat(
