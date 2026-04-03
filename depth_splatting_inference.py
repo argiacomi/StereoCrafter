@@ -16,6 +16,7 @@ from dependency.DepthCrafter.depthcrafter.utils import vis_sequence_depth
 from diffusers.training_utils import set_seed
 from fire import Fire
 from Forward_Warp import forward_warp
+from tqdm import tqdm
 
 # Performance flags for CUDA
 torch.backends.cudnn.benchmark = True
@@ -217,8 +218,12 @@ class DepthCrafterDemo:
         device = self.pipe._execution_device
         chunk_size = max(window_size, overlap + 1)
 
-        for start, stop, keep_from, write_start in iter_window_ranges(
-            num_frames, chunk_size, overlap
+        # Silence per-chunk denoising bars; show one outer progress bar instead
+        self.pipe.set_progress_bar_config(disable=True)
+        chunk_ranges = list(iter_window_ranges(num_frames, chunk_size, overlap))
+
+        for start, stop, keep_from, write_start in tqdm(
+            chunk_ranges, desc="Depth estimation", unit="chunk"
         ):
             chunk_indices = video_plan["frame_indices"][start:stop]
             frames = (
