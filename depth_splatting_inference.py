@@ -597,16 +597,14 @@ def DepthSplatting(
     vid_reader = VideoReader(video_plan["video_path"], ctx=cpu(0))
     video_depth = np.load(depth_result["depth_path"], mmap_mode="r")
 
+    # Forward-Warp is a custom CUDA extension that Dynamo cannot trace
+    # cleanly, so keep this stage eager and manage memory via batch sizing.
     stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
-    eager_stereo_projector = stereo_projector
-    stereo_projector = torch.compile(stereo_projector, mode="default")
-    compiled_stereo_projector = True
 
     num_frames = depth_result["num_frames"]
     height = depth_result["height"]
     width = depth_result["width"]
-    compiled_batch_size = min(batch_size, num_frames)
-    tail_batch_warned = False
+    current_batch_size = max(1, int(batch_size))
 
     # Initialize OpenCV VideoWriter
     out = cv2.VideoWriter(
@@ -618,95 +616,93 @@ def DepthSplatting(
 
     try:
         with torch.inference_mode():
-            for i in range(0, num_frames, batch_size):
-                batch_indices = video_plan["frame_indices"][i : i + batch_size]
-                batch_frames = (
-                    vid_reader.get_batch(batch_indices).asnumpy().astype(np.float32)
-                    / 255.0
-                )
-                batch_depth = np.asarray(video_depth[i : i + batch_size], dtype=np.float32)
-                batch_depth_vis = vis_sequence_depth(batch_depth)
+            frame_offset = 0
+            while frame_offset < num_frames:
+                left_video = None
+                disp_map = None
+                right_video = None
+                occlusion_mask = None
+                try:
+                    batch_indices = video_plan["frame_indices"][
+                        frame_offset : frame_offset + current_batch_size
+                    ]
+                    batch_frames = (
+                        vid_reader.get_batch(batch_indices).asnumpy().astype(np.float32)
+                        / 255.0
+                    )
+                    # Copy the memmap slice so torch.from_numpy receives writable storage.
+                    batch_depth = np.array(
+                        video_depth[frame_offset : frame_offset + current_batch_size],
+                        dtype=np.float32,
+                        copy=True,
+                    )
+                    batch_depth_vis = vis_sequence_depth(batch_depth)
 
-                left_video = (
-                    torch.from_numpy(batch_frames)
-                    .permute(0, 3, 1, 2)
-                    .contiguous()
-                    .pin_memory()
-                    .cuda(non_blocking=True)
-                )
-                disp_map = (
-                    torch.from_numpy(batch_depth)
-                    .float()
-                    .unsqueeze(1)
-                    .pin_memory()
-                    .cuda(non_blocking=True)
-                )
+                    left_video = (
+                        torch.from_numpy(batch_frames)
+                        .permute(0, 3, 1, 2)
+                        .contiguous()
+                        .pin_memory()
+                        .cuda(non_blocking=True)
+                    )
+                    disp_map = (
+                        torch.from_numpy(batch_depth)
+                        .float()
+                        .unsqueeze(1)
+                        .pin_memory()
+                        .cuda(non_blocking=True)
+                    )
 
-                disp_map = disp_map * 2.0 - 1.0
-                disp_map = disp_map * max_disp
-                use_compiled_projector = compiled_stereo_projector and (
-                    len(batch_indices) == compiled_batch_size
-                )
-                if compiled_stereo_projector and not use_compiled_projector:
-                    if not tail_batch_warned:
+                    disp_map = disp_map * 2.0 - 1.0
+                    disp_map = disp_map * max_disp
+
+                    right_video, occlusion_mask = stereo_projector(
+                        left_video, disp_map
+                    )
+
+                    right_video = right_video.cpu().permute(0, 2, 3, 1).numpy()
+                    occlusion_mask = (
+                        occlusion_mask.cpu()
+                        .permute(0, 2, 3, 1)
+                        .numpy()
+                        .repeat(3, axis=-1)
+                    )
+
+                    for j in range(len(batch_frames)):
+                        video_grid_top = np.concatenate(
+                            [batch_frames[j], batch_depth_vis[j]], axis=1
+                        )
+                        video_grid_bottom = np.concatenate(
+                            [occlusion_mask[j], right_video[j]], axis=1
+                        )
+                        video_grid = np.concatenate(
+                            [video_grid_top, video_grid_bottom], axis=0
+                        )
+
+                        video_grid_uint8 = np.clip(video_grid * 255.0, 0, 255).astype(
+                            np.uint8
+                        )
+                        video_grid_bgr = cv2.cvtColor(video_grid_uint8, cv2.COLOR_RGB2BGR)
+                        out.write(video_grid_bgr)
+
+                    frame_offset += len(batch_indices)
+                except Exception as exc:
+                    if is_cuda_oom(exc) and current_batch_size > 1:
+                        next_batch_size = max(1, current_batch_size // 2)
+                        if next_batch_size == current_batch_size:
+                            next_batch_size = current_batch_size - 1
                         print(
-                            "Skipping torch.compile for the undersized tail splatting "
-                            f"batch ({len(batch_indices)} vs {compiled_batch_size} frames) "
-                            "to avoid recompilation/autotuning."
+                            "Stereo splatting hit CUDA OOM; "
+                            f"retrying with batch_size={next_batch_size}."
                         )
-                        tail_batch_warned = True
-                    active_stereo_projector = eager_stereo_projector
-                else:
-                    active_stereo_projector = stereo_projector
-
-                while True:
-                    try:
-                        if use_compiled_projector:
-                            mark_torch_compile_step_begin()
-                        right_video, occlusion_mask = active_stereo_projector(
-                            left_video, disp_map
-                        )
-                        break
-                    except Exception as exc:
-                        if use_compiled_projector and is_torch_compile_failure(exc):
-                            print(
-                                "torch.compile failed for the stereo projector; "
-                                "falling back to eager execution."
-                            )
-                            stereo_projector = eager_stereo_projector
-                            compiled_stereo_projector = False
-                            use_compiled_projector = False
-                            active_stereo_projector = stereo_projector
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            continue
-                        raise
-
-                right_video = right_video.cpu().permute(0, 2, 3, 1).numpy()
-                occlusion_mask = (
-                    occlusion_mask.cpu()
-                    .permute(0, 2, 3, 1)
-                    .numpy()
-                    .repeat(3, axis=-1)
-                )
-
-                for j in range(len(batch_frames)):
-                    video_grid_top = np.concatenate(
-                        [batch_frames[j], batch_depth_vis[j]], axis=1
-                    )
-                    video_grid_bottom = np.concatenate(
-                        [occlusion_mask[j], right_video[j]], axis=1
-                    )
-                    video_grid = np.concatenate([video_grid_top, video_grid_bottom], axis=0)
-
-                    video_grid_uint8 = np.clip(video_grid * 255.0, 0, 255).astype(
-                        np.uint8
-                    )
-                    video_grid_bgr = cv2.cvtColor(video_grid_uint8, cv2.COLOR_RGB2BGR)
-                    out.write(video_grid_bgr)
-
-                del left_video, disp_map, right_video, occlusion_mask
+                        current_batch_size = next_batch_size
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+                    raise
+                finally:
+                    del left_video, disp_map, right_video, occlusion_mask
     finally:
         out.release()
 
@@ -779,6 +775,13 @@ def main(
                 save_depth=save_depth,
                 compile_warmup=compile_warmup,
             )
+
+            # Release DepthCrafter before splatting so the forward-warp stage
+            # does not compete with the diffusion pipeline for VRAM.
+            del depthcrafter_demo
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             DepthSplatting(
                 video_plan,
