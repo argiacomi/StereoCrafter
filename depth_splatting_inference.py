@@ -67,6 +67,22 @@ def from_pretrained_with_dtype_compat(
     raise RuntimeError("Failed to load model with either dtype or torch_dtype.")
 
 
+def try_enable_memory_feature(method_owner, method_name, feature_name, component_name):
+    method = getattr(method_owner, method_name, None)
+    if not callable(method):
+        return False
+
+    try:
+        method()
+        return True
+    except NotImplementedError:
+        print(
+            f"Skipping {component_name} {feature_name}: "
+            f"{component_name} does not implement it."
+        )
+        return False
+
+
 def build_video_plan(video_path, process_length, target_fps, max_res, dataset="open"):
     if dataset == "open":
         print("==> processing video: ", video_path)
@@ -275,14 +291,31 @@ class DepthCrafterDemo:
             variant="fp16",
         )
         self.pipe = self.pipe.to(dtype=torch.float16)
-        if hasattr(self.pipe, "enable_vae_slicing"):
-            self.pipe.enable_vae_slicing()
-        elif hasattr(self.pipe.vae, "enable_slicing"):
-            self.pipe.vae.enable_slicing()
-        if hasattr(self.pipe, "enable_vae_tiling"):
-            self.pipe.enable_vae_tiling()
-        elif hasattr(self.pipe.vae, "enable_tiling"):
-            self.pipe.vae.enable_tiling()
+        vae_name = self.pipe.vae.__class__.__name__
+        if not try_enable_memory_feature(
+            self.pipe,
+            "enable_vae_slicing",
+            "slicing",
+            vae_name,
+        ):
+            try_enable_memory_feature(
+                self.pipe.vae,
+                "enable_slicing",
+                "slicing",
+                vae_name,
+            )
+        if not try_enable_memory_feature(
+            self.pipe,
+            "enable_vae_tiling",
+            "tiling",
+            vae_name,
+        ):
+            try_enable_memory_feature(
+                self.pipe.vae,
+                "enable_tiling",
+                "tiling",
+                vae_name,
+            )
         self._eager_unet = self.pipe.unet
         self._compiled_unet = False
 

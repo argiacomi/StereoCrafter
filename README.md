@@ -102,14 +102,19 @@ There are two main steps in this script for generating stereo video.
 #### 1. Depth-Based Video Splatting Using the Video Depth from DepthCrafter
 Execute the following command:
 ```bash
-python depth_splatting_inference.py --pre_trained_path [PATH] --unet_path [PATH]
-                                    --input_video_path [PATH] --output_video_path [PATH]
+python depth_splatting_inference.py \
+    --pre_trained_path [PATH] \
+    --unet_path [PATH] \
+    --input_video_path [PATH] \
+    --output_video_path [PATH] \
+    --target_fps [FPS]
 ```
 Arguments:
 - `--pre_trained_path`: Path to the SVD img2vid model weights (e.g., `./weights/stable-video-diffusion-img2vid-xt-1-1`).
 - `--unet_path`: Path to the DepthCrafter model weights (e.g., `./weights/DepthCrafter`).
 - `--input_video_path`: Path to the input video (e.g., `./source_video/camel.mp4`).
 - `--output_video_path`: Path to the output video (e.g., `./outputs/camel_splatting_results.mp4`).
+- `--target_fps`: Optional output FPS used for frame sampling. Default is `-1`, which keeps the source video FPS.
 - `--max_disp`: Parameter controlling the maximum disparity between the generated right video and the input left video. Default value is `20` pixels.
 - `--resume`: Reuse the persistent depth cache on reruns. Default is `True`.
 - `--cache_dir`: Optional directory for the persistent depth cache. By default StereoCrafter uses `[output_video_path without .mp4]_depth_cache`.
