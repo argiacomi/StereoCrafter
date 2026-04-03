@@ -116,11 +116,6 @@ Arguments:
 - `--output_video_path`: Path to the output video (e.g., `./outputs/camel_splatting_results.mp4`).
 - `--target_fps`: Optional output FPS used for frame sampling. Default is `-1`, which keeps the source video FPS.
 - `--max_disp`: Parameter controlling the maximum disparity between the generated right video and the input left video. Default value is `20` pixels.
-- `--resume`: Reuse the persistent depth cache on reruns. Default is `True`.
-- `--cache_dir`: Optional directory for the persistent depth cache. By default StereoCrafter uses `[output_video_path without .mp4]_depth_cache`.
-- `--reset_cache`: Clear any existing cached depth chunks for this output before starting over. Default is `False`.
-
-If the depth stage fails mid-run, rerunning the same command will resume from the cached raw depth chunks instead of recomputing the whole DepthCrafter pass.
 
 The first step generates a video grid with input video, visualized depth map, occlusion mask, and splatting right video, as shown below:
 
