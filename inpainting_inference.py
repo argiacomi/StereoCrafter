@@ -1,3 +1,4 @@
+import gc
 import os
 
 import cv2
@@ -37,6 +38,40 @@ def mark_torch_compile_step_begin():
         torch.compiler.cudagraph_mark_step_begin()
 
 
+def is_cuda_oom(exc):
+    oom_types = tuple(
+        t
+        for t in (
+            getattr(torch, "OutOfMemoryError", None),
+            getattr(torch.cuda, "OutOfMemoryError", None)
+            if hasattr(torch, "cuda")
+            else None,
+        )
+        if t is not None
+    )
+    if oom_types and isinstance(exc, oom_types):
+        return True
+    return "out of memory" in str(exc).lower()
+
+
+def spatial_tile_shape(height, width, tile_num, tile_overlap=(128, 128)):
+    tile_size = (
+        int((height + tile_overlap[0] * (tile_num - 1)) / tile_num),
+        int((width + tile_overlap[1] * (tile_num - 1)) / tile_num),
+    )
+    tile_stride = (tile_size[0] - tile_overlap[0], tile_size[1] - tile_overlap[1])
+    return tile_size, tile_stride
+
+
+def max_supported_tile_num(height, width, tile_overlap=(128, 128)):
+    tile_num = 1
+    while True:
+        _, tile_stride = spatial_tile_shape(height, width, tile_num, tile_overlap)
+        if tile_stride[0] <= 0 or tile_stride[1] <= 0:
+            return max(1, tile_num - 1)
+        tile_num += 1
+
+
 def blend_h(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor:
     weight_b = (torch.arange(overlap_size).view(1, 1, 1, -1) / overlap_size).to(
         b.device
@@ -69,11 +104,12 @@ def spatial_tiled_process(
     width = cond_frames.shape[3]
 
     tile_overlap = (128, 128)
-    tile_size = (
-        int((height + tile_overlap[0] * (tile_num - 1)) / tile_num),
-        int((width + tile_overlap[1] * (tile_num - 1)) / tile_num),
-    )
-    tile_stride = ((tile_size[0] - tile_overlap[0]), (tile_size[1] - tile_overlap[1]))
+    tile_size, tile_stride = spatial_tile_shape(height, width, tile_num, tile_overlap)
+    if tile_stride[0] <= 0 or tile_stride[1] <= 0:
+        raise ValueError(
+            f"`tile_num={tile_num}` is too large for frame size {(height, width)} "
+            f"with tile overlap {tile_overlap}."
+        )
 
     cols = []
     for i in range(0, tile_num):
@@ -283,6 +319,12 @@ def main(
         raise ValueError(
             f"Input video is too small after 128-alignment: derived output size is {(height, width)}."
         )
+    max_tile_num = max_supported_tile_num(height, width)
+    if tile_num > max_tile_num:
+        raise ValueError(
+            f"`tile_num={tile_num}` is too large for frame size {(height, width)}. "
+            f"Maximum supported tile_num is {max_tile_num}."
+        )
 
     frames_sbs_path = os.path.join(save_dir, f"{video_name}_sbs.mp4")
     vid_anaglyph_path = os.path.join(save_dir, f"{video_name}_anaglyph.mp4")
@@ -291,6 +333,7 @@ def main(
 
     generated_context = None
     step = frames_chunk - overlap
+    current_tile_num = tile_num
 
     try:
         with torch.inference_mode():
@@ -331,22 +374,40 @@ def main(
                             f"i: {i}, cur_i: {cur_i}, cur_overlap: {cur_overlap}, input_frames_i: {input_frames_i.shape}, generated_context: {generated_context.shape}"
                         )
 
-                if cpu_offload is None:
-                    mark_torch_compile_step_begin()
-                video_latents = spatial_tiled_process(
-                    input_frames_i,
-                    frames_mask,
-                    pipeline,
-                    tile_num,
-                    spatial_n_compress=8,
-                    min_guidance_scale=guidance_scale,
-                    max_guidance_scale=guidance_scale,
-                    fps=7,
-                    motion_bucket_id=127,
-                    noise_aug_strength=noise_aug_strength,
-                    num_inference_steps=num_inference_steps,
-                    vae_encode_chunk_size=vae_encode_chunk_size,
-                )
+                while True:
+                    try:
+                        if cpu_offload is None:
+                            mark_torch_compile_step_begin()
+                        video_latents = spatial_tiled_process(
+                            input_frames_i,
+                            frames_mask,
+                            pipeline,
+                            current_tile_num,
+                            spatial_n_compress=8,
+                            min_guidance_scale=guidance_scale,
+                            max_guidance_scale=guidance_scale,
+                            fps=7,
+                            motion_bucket_id=127,
+                            noise_aug_strength=noise_aug_strength,
+                            num_inference_steps=num_inference_steps,
+                            vae_encode_chunk_size=vae_encode_chunk_size,
+                        )
+                        break
+                    except Exception as exc:
+                        if is_cuda_oom(exc) and current_tile_num < max_tile_num:
+                            next_tile_num = current_tile_num + 1
+                            print(
+                                "Spatial tiling hit CUDA OOM; "
+                                f"retrying with tile_num={next_tile_num}."
+                            )
+                            current_tile_num = next_tile_num
+                            if hasattr(pipeline.vae, "enable_tiling"):
+                                pipeline.vae.enable_tiling()
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+                        raise
 
                 video_latents = video_latents.unsqueeze(0)
 
