@@ -243,12 +243,6 @@ def main(
             f"Unknown cpu_offload mode '{cpu_offload}'. Expected None, 'sequential', or 'model'."
         )
 
-    try:
-        pipeline.enable_xformers_memory_efficient_attention()
-    except Exception as e:
-        print(e)
-        print("Xformers is not enabled")
-
     if tile_num > 1 and hasattr(pipeline.vae, "enable_tiling"):
         pipeline.vae.enable_tiling()
 

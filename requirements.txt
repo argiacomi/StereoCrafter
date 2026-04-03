@@ -6,7 +6,6 @@ safetensors
 transformers
 decord
 diffusers
-xformers
 av
 matplotlib
 mediapy

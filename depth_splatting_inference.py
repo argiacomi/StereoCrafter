@@ -148,13 +148,13 @@ class DepthCrafterDemo:
         unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
             unet_path,
             low_cpu_mem_usage=True,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         )
         # load weights of other components from the provided checkpoint
         self.pipe = DepthCrafterPipeline.from_pretrained(
             pre_trained_path,
             unet=unet,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             variant="fp16",
         )
 
@@ -172,11 +172,9 @@ class DepthCrafterDemo:
                 "Expected None, 'sequential', or 'model'."
             )
 
-        try:
-            self.pipe.enable_xformers_memory_efficient_attention()
-        except Exception as e:
-            print(e)
-            print("Xformers is not enabled")
+        # PyTorch 2.x uses scaled_dot_product_attention (SDPA) by default,
+        # which supports all GPU architectures including Blackwell (sm_120).
+        # xformers kernels do not support compute capability >= 12.0.
 
     def infer(
         self,
