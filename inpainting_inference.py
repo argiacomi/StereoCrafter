@@ -11,47 +11,14 @@ from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
     tensor2vid,
 )
+from torch_runtime_utils import (
+    configure_cuda_performance_flags,
+    is_cuda_oom,
+    mark_torch_compile_step_begin,
+)
 from transformers import CLIPVisionModelWithProjection
 
-torch.backends.cudnn.benchmark = True
-
-if hasattr(torch.backends, "fp32_precision"):
-    torch.backends.fp32_precision = "ieee"
-
-if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
-    torch.backends.cuda.matmul.fp32_precision = "tf32"
-else:
-    torch.backends.cuda.matmul.allow_tf32 = True
-
-if hasattr(torch.backends.cudnn, "conv") and hasattr(
-    torch.backends.cudnn.conv, "fp32_precision"
-):
-    torch.backends.cudnn.conv.fp32_precision = "tf32"
-else:
-    torch.backends.cudnn.allow_tf32 = True
-
-
-def mark_torch_compile_step_begin():
-    if hasattr(torch, "compiler") and hasattr(
-        torch.compiler, "cudagraph_mark_step_begin"
-    ):
-        torch.compiler.cudagraph_mark_step_begin()
-
-
-def is_cuda_oom(exc):
-    oom_types = tuple(
-        t
-        for t in (
-            getattr(torch, "OutOfMemoryError", None),
-            getattr(torch.cuda, "OutOfMemoryError", None)
-            if hasattr(torch, "cuda")
-            else None,
-        )
-        if t is not None
-    )
-    if oom_types and isinstance(exc, oom_types):
-        return True
-    return "out of memory" in str(exc).lower()
+configure_cuda_performance_flags()
 
 
 def spatial_tile_shape(height, width, tile_num, tile_overlap=(128, 128)):

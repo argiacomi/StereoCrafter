@@ -1,8 +1,9 @@
 import gc
+import hashlib
+import json
 import os
 import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 import cv2
@@ -25,24 +26,15 @@ if FORWARD_WARP_ROOT.is_dir() and str(FORWARD_WARP_ROOT) not in sys.path:
 
 from Forward_Warp import forward_warp
 from tqdm import tqdm
+from torch_runtime_utils import (
+    configure_cuda_performance_flags,
+    is_cuda_oom,
+    is_torch_compile_failure,
+    mark_torch_compile_step_begin,
+)
 
-# Performance flags for CUDA
-torch.backends.cudnn.benchmark = True
-
-if hasattr(torch.backends, "fp32_precision"):
-    torch.backends.fp32_precision = "ieee"
-
-if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
-    torch.backends.cuda.matmul.fp32_precision = "tf32"
-else:
-    torch.backends.cuda.matmul.allow_tf32 = True
-
-if hasattr(torch.backends.cudnn, "conv") and hasattr(
-    torch.backends.cudnn.conv, "fp32_precision"
-):
-    torch.backends.cudnn.conv.fp32_precision = "tf32"
-else:
-    torch.backends.cudnn.allow_tf32 = True
+configure_cuda_performance_flags()
+DEPTH_CACHE_VERSION = 1
 
 
 def from_pretrained_with_dtype_compat(
@@ -73,48 +65,6 @@ def from_pretrained_with_dtype_compat(
         raise last_exc
 
     raise RuntimeError("Failed to load model with either dtype or torch_dtype.")
-
-
-def is_torch_compile_failure(exc):
-    needles = (
-        "torch._dynamo",
-        "Dynamo failed",
-        "TorchRuntimeError",
-        "fake tensors",
-        "BackendCompilerFailed",
-    )
-    current = exc
-    while current is not None:
-        message = str(current)
-        if any(needle in message for needle in needles):
-            return True
-        current = current.__cause__ or current.__context__
-    return False
-
-
-def mark_torch_compile_step_begin():
-    if hasattr(torch, "compiler") and hasattr(
-        torch.compiler, "cudagraph_mark_step_begin"
-    ):
-        torch.compiler.cudagraph_mark_step_begin()
-
-
-def is_cuda_oom(exc):
-    oom_types = tuple(
-        t
-        for t in (
-            getattr(torch, "OutOfMemoryError", None),
-            (
-                getattr(torch.cuda, "OutOfMemoryError", None)
-                if hasattr(torch, "cuda")
-                else None
-            ),
-        )
-        if t is not None
-    )
-    if oom_types and isinstance(exc, oom_types):
-        return True
-    return "out of memory" in str(exc).lower()
 
 
 def build_video_plan(video_path, process_length, target_fps, max_res, dataset="open"):
@@ -231,6 +181,75 @@ def normalize_depth_batch(depth_batch, depth_min, depth_max):
     return np.clip((depth_batch - depth_min) / denom, 0.0, 1.0).astype(np.float32)
 
 
+def atomic_write_json(path, payload):
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    os.replace(temp_path, path)
+
+
+def load_json_or_none(path):
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def frame_indices_digest(frame_indices):
+    frame_array = np.asarray(frame_indices, dtype=np.int64)
+    return hashlib.sha256(frame_array.tobytes()).hexdigest()
+
+
+def build_depth_cache_config(
+    video_plan,
+    unet_path,
+    pre_trained_path,
+    num_denoising_steps,
+    guidance_scale,
+    window_size,
+    overlap,
+    seed,
+):
+    input_video_path = Path(video_plan["video_path"]).resolve()
+    input_video_stat = input_video_path.stat()
+    return {
+        "version": DEPTH_CACHE_VERSION,
+        "input_video_path": str(input_video_path),
+        "input_video_size": int(input_video_stat.st_size),
+        "input_video_mtime_ns": int(input_video_stat.st_mtime_ns),
+        "unet_path": str(Path(unet_path).resolve()),
+        "pre_trained_path": str(Path(pre_trained_path).resolve()),
+        "frame_indices_digest": frame_indices_digest(video_plan["frame_indices"]),
+        "num_frames": len(video_plan["frame_indices"]),
+        "fps": float(video_plan["fps"]),
+        "original_height": int(video_plan["original_height"]),
+        "original_width": int(video_plan["original_width"]),
+        "resized_height": int(video_plan["resized_height"]),
+        "resized_width": int(video_plan["resized_width"]),
+        "num_denoising_steps": int(num_denoising_steps),
+        "guidance_scale": float(guidance_scale),
+        "window_size": int(window_size),
+        "overlap": int(overlap),
+        "seed": int(seed),
+    }
+
+
+def reset_cache_dir(cache_dir):
+    if os.path.isdir(cache_dir):
+        shutil.rmtree(cache_dir)
+    os.makedirs(cache_dir, exist_ok=True)
+
+
+def resolve_depth_cache_dir(output_video_path, cache_dir=None):
+    if cache_dir is not None:
+        return os.path.abspath(cache_dir)
+    output_path = Path(output_video_path).resolve()
+    return f"{output_path.with_suffix('')}_depth_cache"
+
+
 class DepthCrafterDemo:
     def __init__(
         self,
@@ -238,6 +257,8 @@ class DepthCrafterDemo:
         pre_trained_path: str,
         cpu_offload: str = None,
     ):
+        self.unet_path = unet_path
+        self.pre_trained_path = pre_trained_path
         unet = from_pretrained_with_dtype_compat(
             DiffusersUNetSpatioTemporalConditionModelDepthCrafter,
             unet_path,
@@ -297,6 +318,7 @@ class DepthCrafterDemo:
         seed: int = 42,
         track_time: bool = False,
         save_depth: bool = False,
+        resume: bool = True,
     ):
         set_seed(seed)
         num_frames = len(video_plan["frame_indices"])
@@ -308,73 +330,147 @@ class DepthCrafterDemo:
         save_path = os.path.join(
             os.path.dirname(output_video_path), os.path.splitext(os.path.basename(output_video_path))[0]
         )
-
+        os.makedirs(scratch_dir, exist_ok=True)
+        state_path = os.path.join(scratch_dir, "state.json")
         raw_depth_path = os.path.join(scratch_dir, "depth_raw.npy")
-        raw_depth = np.lib.format.open_memmap(
-            raw_depth_path,
-            mode="w+",
-            dtype=np.float32,
-            shape=(num_frames, original_height, original_width),
-        )
-
-        resized_reader = VideoReader(
-            video_plan["video_path"],
-            ctx=cpu(0),
-            width=resized_width,
-            height=resized_height,
-        )
-        device = self.pipe._execution_device
+        normalized_depth_path = os.path.join(scratch_dir, "depth_normalized.npy")
         chunk_size = max(window_size, overlap + 1)
-
-        # Silence per-chunk denoising bars; show one outer progress bar instead
-        self.pipe.set_progress_bar_config(disable=True)
         chunk_ranges = list(iter_window_ranges(num_frames, chunk_size, overlap))
+        total_chunks = len(chunk_ranges)
         current_decode_chunk_size = max(1, int(decode_chunk_size))
 
-        for start, stop, keep_from, write_start in tqdm(
-            chunk_ranges, desc="Depth estimation", unit="chunk"
-        ):
-            chunk_indices = video_plan["frame_indices"][start:stop]
-            frames = (
-                resized_reader.get_batch(chunk_indices).asnumpy().astype(np.float32) / 255.0
+        cache_config = build_depth_cache_config(
+            video_plan,
+            self.unet_path,
+            self.pre_trained_path,
+            num_denoising_steps,
+            guidance_scale,
+            window_size,
+            overlap,
+            seed,
+        )
+        state = load_json_or_none(state_path) if resume else None
+        if state is not None and state.get("config") != cache_config:
+            print(
+                "Existing depth cache is incompatible with this run; "
+                "clearing it and starting over."
             )
+            reset_cache_dir(scratch_dir)
+            state = None
 
-            with torch.inference_mode():
-                while True:
-                    if self._compiled_unet:
-                        mark_torch_compile_step_begin()
-                    try:
-                        chunk_depth = self.pipe(
-                            frames,
-                            height=frames.shape[1],
-                            width=frames.shape[2],
-                            output_type="np",
-                            guidance_scale=guidance_scale,
-                            num_inference_steps=num_denoising_steps,
-                            window_size=window_size,
-                            overlap=overlap,
-                            decode_chunk_size=current_decode_chunk_size,
-                            track_time=track_time,
-                        ).frames[0]
-                        break
-                    except Exception as exc:
-                        if self._compiled_unet and is_torch_compile_failure(exc):
-                            print(
-                                "torch.compile failed for the DepthCrafter UNet; "
-                                "falling back to eager execution."
-                            )
-                            self.pipe.unet = self._eager_unet
-                            self._compiled_unet = False
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            continue
+        if state is None:
+            state = {
+                "config": cache_config,
+                "stage": "raw_in_progress",
+                "total_chunks": total_chunks,
+                "completed_chunks": 0,
+            }
+            atomic_write_json(state_path, state)
 
-                        if is_cuda_oom(exc):
-                            if self._compiled_unet:
+        if (
+            state.get("stage") == "normalized_complete"
+            and os.path.isfile(normalized_depth_path)
+        ):
+            print(f"Reusing completed depth cache from {scratch_dir}.")
+            if save_depth:
+                shutil.copy2(normalized_depth_path, save_path + "_depth.npy")
+            return {
+                "depth_path": normalized_depth_path,
+                "num_frames": num_frames,
+                "height": original_height,
+                "width": original_width,
+                "cache_dir": scratch_dir,
+            }
+
+        raw_depth = None
+        completed_chunks = 0
+        if (
+            state.get("stage") in {"raw_in_progress", "raw_complete", "normalizing"}
+            and os.path.isfile(raw_depth_path)
+        ):
+            try:
+                raw_depth = np.load(raw_depth_path, mmap_mode="r+")
+            except (OSError, ValueError):
+                raw_depth = None
+            if raw_depth is not None and raw_depth.shape != (
+                num_frames,
+                original_height,
+                original_width,
+            ):
+                del raw_depth
+                raw_depth = None
+            if raw_depth is not None:
+                completed_chunks = min(
+                    max(int(state.get("completed_chunks", 0)), 0), total_chunks
+                )
+
+        if raw_depth is None:
+            state["stage"] = "raw_in_progress"
+            state["completed_chunks"] = 0
+            atomic_write_json(state_path, state)
+            raw_depth = np.lib.format.open_memmap(
+                raw_depth_path,
+                mode="w+",
+                dtype=np.float32,
+                shape=(num_frames, original_height, original_width),
+            )
+            completed_chunks = 0
+
+        if completed_chunks < total_chunks:
+            print(
+                f"Using depth cache at {scratch_dir}. "
+                f"Completed chunks: {completed_chunks}/{total_chunks}."
+            )
+            resized_reader = VideoReader(
+                video_plan["video_path"],
+                ctx=cpu(0),
+                width=resized_width,
+                height=resized_height,
+            )
+            device = self.pipe._execution_device
+
+            # Silence per-chunk denoising bars; show one outer progress bar instead
+            self.pipe.set_progress_bar_config(disable=True)
+            remaining_chunk_ranges = chunk_ranges[completed_chunks:]
+            for chunk_idx, (start, stop, keep_from, write_start) in enumerate(
+                tqdm(
+                    remaining_chunk_ranges,
+                    desc="Depth estimation",
+                    unit="chunk",
+                    initial=completed_chunks,
+                    total=total_chunks,
+                ),
+                start=completed_chunks,
+            ):
+                chunk_indices = video_plan["frame_indices"][start:stop]
+                frames = (
+                    resized_reader.get_batch(chunk_indices).asnumpy().astype(np.float32)
+                    / 255.0
+                )
+
+                with torch.inference_mode():
+                    while True:
+                        if self._compiled_unet:
+                            mark_torch_compile_step_begin()
+                        try:
+                            chunk_depth = self.pipe(
+                                frames,
+                                height=frames.shape[1],
+                                width=frames.shape[2],
+                                output_type="np",
+                                guidance_scale=guidance_scale,
+                                num_inference_steps=num_denoising_steps,
+                                window_size=window_size,
+                                overlap=overlap,
+                                decode_chunk_size=current_decode_chunk_size,
+                                track_time=track_time,
+                            ).frames[0]
+                            break
+                        except Exception as exc:
+                            if self._compiled_unet and is_torch_compile_failure(exc):
                                 print(
-                                    "DepthCrafter hit CUDA OOM with a compiled UNet; "
-                                    "retrying in eager mode."
+                                    "torch.compile failed for the DepthCrafter UNet; "
+                                    "falling back to eager execution."
                                 )
                                 self.pipe.unet = self._eager_unet
                                 self._compiled_unet = False
@@ -383,51 +479,77 @@ class DepthCrafterDemo:
                                     torch.cuda.empty_cache()
                                 continue
 
-                            if current_decode_chunk_size > 1:
-                                next_decode_chunk_size = max(
-                                    1, current_decode_chunk_size // 2
-                                )
-                                if next_decode_chunk_size == current_decode_chunk_size:
-                                    next_decode_chunk_size = (
-                                        current_decode_chunk_size - 1
+                            if is_cuda_oom(exc):
+                                if self._compiled_unet:
+                                    print(
+                                        "DepthCrafter hit CUDA OOM with a compiled UNet; "
+                                        "retrying in eager mode."
                                     )
-                                print(
-                                    "DepthCrafter hit CUDA OOM during VAE decode; "
-                                    f"retrying with decode_chunk_size={next_decode_chunk_size}."
-                                )
-                                current_decode_chunk_size = next_decode_chunk_size
-                                gc.collect()
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                                continue
+                                    self.pipe.unet = self._eager_unet
+                                    self._compiled_unet = False
+                                    gc.collect()
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                    continue
 
-                        raise
+                                if current_decode_chunk_size > 1:
+                                    next_decode_chunk_size = max(
+                                        1, current_decode_chunk_size // 2
+                                    )
+                                    if next_decode_chunk_size == current_decode_chunk_size:
+                                        next_decode_chunk_size = (
+                                            current_decode_chunk_size - 1
+                                        )
+                                    print(
+                                        "DepthCrafter hit CUDA OOM during VAE decode; "
+                                        f"retrying with decode_chunk_size={next_decode_chunk_size}."
+                                    )
+                                    current_decode_chunk_size = next_decode_chunk_size
+                                    gc.collect()
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                    continue
 
-            chunk_depth = chunk_depth.sum(-1) / chunk_depth.shape[-1]
-            chunk_depth = resize_depth_to_original(
-                chunk_depth, original_height, original_width, device
-            )
+                            raise
 
-            # Blend overlap region with previously written depth to avoid
-            # hard temporal cuts between independently-processed chunks.
-            if keep_from > 0:
-                overlap_new = chunk_depth[:keep_from]
-                overlap_old = np.array(raw_depth[start : start + keep_from])
-                weights = np.linspace(1.0, 0.0, keep_from, dtype=np.float32)[
-                    :, None, None
-                ]
-                blended = overlap_old * weights + overlap_new * (1.0 - weights)
-                raw_depth[start : start + keep_from] = blended
+                chunk_depth = chunk_depth.sum(-1) / chunk_depth.shape[-1]
+                chunk_depth = resize_depth_to_original(
+                    chunk_depth, original_height, original_width, device
+                )
 
-            unique_depth = chunk_depth[keep_from:]
-            write_stop = write_start + len(unique_depth)
-            raw_depth[write_start:write_stop] = unique_depth
+                # Blend overlap region with previously written depth to avoid
+                # hard temporal cuts between independently-processed chunks.
+                if keep_from > 0:
+                    overlap_new = chunk_depth[:keep_from]
+                    overlap_old = np.array(raw_depth[start : start + keep_from])
+                    weights = np.linspace(1.0, 0.0, keep_from, dtype=np.float32)[
+                        :, None, None
+                    ]
+                    blended = overlap_old * weights + overlap_new * (1.0 - weights)
+                    raw_depth[start : start + keep_from] = blended
+
+                unique_depth = chunk_depth[keep_from:]
+                write_stop = write_start + len(unique_depth)
+                raw_depth[write_start:write_stop] = unique_depth
+                raw_depth.flush()
+
+                state["completed_chunks"] = chunk_idx + 1
+                atomic_write_json(state_path, state)
+
+            del resized_reader
+            state["stage"] = "raw_complete"
+            state["completed_chunks"] = total_chunks
+            atomic_write_json(state_path, state)
+        else:
+            print(f"Skipping DepthCrafter inference and reusing raw depth from {scratch_dir}.")
 
         del raw_depth
+        state["stage"] = "normalizing"
+        atomic_write_json(state_path, state)
 
-        # Compute min/max from the finalized memmap so blended overlap
-        # regions are included and no stale pre-blend extrema leak through.
-        raw_depth = np.load(raw_depth_path, mmap_mode="r+")
+        # Normalize from the finalized raw depth into a separate file so a
+        # failed normalization pass never destroys resumable raw outputs.
+        raw_depth = np.load(raw_depth_path, mmap_mode="r")
         depth_min = np.inf
         depth_max = -np.inf
         for start, stop in iter_batch_ranges(num_frames, 64):
@@ -435,6 +557,12 @@ class DepthCrafterDemo:
             depth_min = min(depth_min, float(batch.min()))
             depth_max = max(depth_max, float(batch.max()))
 
+        normalized_depth = np.lib.format.open_memmap(
+            normalized_depth_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(num_frames, original_height, original_width),
+        )
         depth_vis_writer = None
         if save_depth:
             depth_vis_writer = create_video_writer(
@@ -448,7 +576,7 @@ class DepthCrafterDemo:
             normalized_batch = normalize_depth_batch(
                 raw_depth[start:stop], depth_min, depth_max
             )
-            raw_depth[start:stop] = normalized_batch
+            normalized_depth[start:stop] = normalized_batch
 
             if depth_vis_writer is not None:
                 depth_vis = np.clip(
@@ -461,15 +589,21 @@ class DepthCrafterDemo:
             depth_vis_writer.release()
 
         del raw_depth
+        normalized_depth.flush()
+        del normalized_depth
+
+        state["stage"] = "normalized_complete"
+        atomic_write_json(state_path, state)
 
         if save_depth:
-            shutil.copy2(raw_depth_path, save_path + "_depth.npy")
+            shutil.copy2(normalized_depth_path, save_path + "_depth.npy")
 
         return {
-            "depth_path": raw_depth_path,
+            "depth_path": normalized_depth_path,
             "num_frames": num_frames,
             "height": original_height,
             "width": original_width,
+            "cache_dir": scratch_dir,
         }
 
 
@@ -531,7 +665,9 @@ def DepthSplatting(
     video_depth = np.load(depth_result["depth_path"], mmap_mode="r")
 
     stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
+    eager_stereo_projector = stereo_projector
     stereo_projector = torch.compile(stereo_projector, mode="max-autotune")
+    compiled_stereo_projector = True
 
     num_frames = depth_result["num_frames"]
     height = depth_result["height"]
@@ -545,51 +681,83 @@ def DepthSplatting(
         (width * 2, height * 2),
     )
 
-    with torch.inference_mode():
-        for i in range(0, num_frames, batch_size):
-            batch_indices = video_plan["frame_indices"][i : i + batch_size]
-            batch_frames = (
-                vid_reader.get_batch(batch_indices).asnumpy().astype(np.float32) / 255.0
-            )
-            batch_depth = np.asarray(video_depth[i : i + batch_size], dtype=np.float32)
-            batch_depth_vis = vis_sequence_depth(batch_depth)
+    try:
+        with torch.inference_mode():
+            for i in range(0, num_frames, batch_size):
+                batch_indices = video_plan["frame_indices"][i : i + batch_size]
+                batch_frames = (
+                    vid_reader.get_batch(batch_indices).asnumpy().astype(np.float32)
+                    / 255.0
+                )
+                batch_depth = np.asarray(video_depth[i : i + batch_size], dtype=np.float32)
+                batch_depth_vis = vis_sequence_depth(batch_depth)
 
-            left_video = (
-                torch.from_numpy(batch_frames)
-                .permute(0, 3, 1, 2)
-                .contiguous()
-                .pin_memory()
-                .cuda(non_blocking=True)
-            )
-            disp_map = (
-                torch.from_numpy(batch_depth)
-                .float()
-                .unsqueeze(1)
-                .pin_memory()
-                .cuda(non_blocking=True)
-            )
+                left_video = (
+                    torch.from_numpy(batch_frames)
+                    .permute(0, 3, 1, 2)
+                    .contiguous()
+                    .pin_memory()
+                    .cuda(non_blocking=True)
+                )
+                disp_map = (
+                    torch.from_numpy(batch_depth)
+                    .float()
+                    .unsqueeze(1)
+                    .pin_memory()
+                    .cuda(non_blocking=True)
+                )
 
-            disp_map = disp_map * 2.0 - 1.0
-            disp_map = disp_map * max_disp
+                disp_map = disp_map * 2.0 - 1.0
+                disp_map = disp_map * max_disp
 
-            mark_torch_compile_step_begin()
-            right_video, occlusion_mask = stereo_projector(left_video, disp_map)
+                while True:
+                    try:
+                        if compiled_stereo_projector:
+                            mark_torch_compile_step_begin()
+                        right_video, occlusion_mask = stereo_projector(
+                            left_video, disp_map
+                        )
+                        break
+                    except Exception as exc:
+                        if compiled_stereo_projector and is_torch_compile_failure(exc):
+                            print(
+                                "torch.compile failed for the stereo projector; "
+                                "falling back to eager execution."
+                            )
+                            stereo_projector = eager_stereo_projector
+                            compiled_stereo_projector = False
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+                        raise
 
-            right_video = right_video.cpu().permute(0, 2, 3, 1).numpy()
-            occlusion_mask = occlusion_mask.cpu().permute(0, 2, 3, 1).numpy().repeat(3, axis=-1)
+                right_video = right_video.cpu().permute(0, 2, 3, 1).numpy()
+                occlusion_mask = (
+                    occlusion_mask.cpu()
+                    .permute(0, 2, 3, 1)
+                    .numpy()
+                    .repeat(3, axis=-1)
+                )
 
-            for j in range(len(batch_frames)):
-                video_grid_top = np.concatenate([batch_frames[j], batch_depth_vis[j]], axis=1)
-                video_grid_bottom = np.concatenate([occlusion_mask[j], right_video[j]], axis=1)
-                video_grid = np.concatenate([video_grid_top, video_grid_bottom], axis=0)
+                for j in range(len(batch_frames)):
+                    video_grid_top = np.concatenate(
+                        [batch_frames[j], batch_depth_vis[j]], axis=1
+                    )
+                    video_grid_bottom = np.concatenate(
+                        [occlusion_mask[j], right_video[j]], axis=1
+                    )
+                    video_grid = np.concatenate([video_grid_top, video_grid_bottom], axis=0)
 
-                video_grid_uint8 = np.clip(video_grid * 255.0, 0, 255).astype(np.uint8)
-                video_grid_bgr = cv2.cvtColor(video_grid_uint8, cv2.COLOR_RGB2BGR)
-                out.write(video_grid_bgr)
+                    video_grid_uint8 = np.clip(video_grid * 255.0, 0, 255).astype(
+                        np.uint8
+                    )
+                    video_grid_bgr = cv2.cvtColor(video_grid_uint8, cv2.COLOR_RGB2BGR)
+                    out.write(video_grid_bgr)
 
-            del left_video, disp_map, right_video, occlusion_mask
-
-    out.release()
+                del left_video, disp_map, right_video, occlusion_mask
+    finally:
+        out.release()
 
 
 def main(
@@ -612,6 +780,9 @@ def main(
     seed: int = 42,
     track_time: bool = False,
     save_depth: bool = False,
+    cache_dir: str = None,
+    resume: bool = True,
+    reset_cache: bool = False,
 ):
     video_plan = build_video_plan(
         input_video_path,
@@ -627,9 +798,17 @@ def main(
         cpu_offload=cpu_offload,
     )
 
-    scratch_root = os.path.dirname(output_video_path) or "."
-    os.makedirs(scratch_root, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="stereocrafter_depth_", dir=scratch_root) as scratch_dir:
+    output_root = os.path.dirname(output_video_path) or "."
+    os.makedirs(output_root, exist_ok=True)
+    scratch_dir = resolve_depth_cache_dir(output_video_path, cache_dir=cache_dir)
+    if reset_cache or not resume:
+        print(f"Resetting depth cache at {scratch_dir}.")
+        reset_cache_dir(scratch_dir)
+    else:
+        os.makedirs(scratch_dir, exist_ok=True)
+
+    print(f"Depth cache directory: {scratch_dir}")
+    try:
         depth_result = depthcrafter_demo.infer(
             video_plan,
             output_video_path,
@@ -642,6 +821,7 @@ def main(
             seed=seed,
             track_time=track_time,
             save_depth=save_depth,
+            resume=resume,
         )
 
         DepthSplatting(
@@ -651,6 +831,12 @@ def main(
             max_disp,
             batch_size,
         )
+    except Exception:
+        print(
+            f"Run failed. Preserved depth cache at {scratch_dir}. "
+            "Re-run the same command to resume."
+        )
+        raise
 
 
 if __name__ == "__main__":
