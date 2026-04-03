@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import torch
 
 
@@ -65,3 +68,83 @@ def is_cuda_oom(exc):
     if oom_types and isinstance(exc, oom_types):
         return True
     return "out of memory" in str(exc).lower()
+
+
+def configure_compile_cache(cache_dir):
+    cache_path = Path(cache_dir).expanduser().resolve()
+    cache_path.mkdir(parents=True, exist_ok=True)
+    triton_cache_path = cache_path / "triton"
+    triton_cache_path.mkdir(parents=True, exist_ok=True)
+
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(cache_path)
+    os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+    os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
+    os.environ.setdefault("TRITON_CACHE_DIR", str(triton_cache_path))
+    return str(cache_path)
+
+
+def load_compile_artifacts(artifact_path):
+    load_fn = getattr(getattr(torch, "compiler", None), "load_cache_artifacts", None)
+    if load_fn is None:
+        return False
+
+    artifact_path = Path(artifact_path)
+    if not artifact_path.is_file():
+        return False
+
+    try:
+        artifact_bytes = artifact_path.read_bytes()
+    except OSError as exc:
+        print(f"Failed to read torch.compile artifacts from {artifact_path}: {exc}")
+        return False
+
+    if not artifact_bytes:
+        return False
+
+    try:
+        load_fn(artifact_bytes)
+    except Exception as exc:
+        print(f"Failed to load torch.compile artifacts from {artifact_path}: {exc}")
+        return False
+
+    print(f"Loaded torch.compile artifacts from {artifact_path}.")
+    return True
+
+
+def save_compile_artifacts(artifact_path):
+    save_fn = getattr(getattr(torch, "compiler", None), "save_cache_artifacts", None)
+    if save_fn is None:
+        return False
+
+    try:
+        serialized = save_fn()
+    except Exception as exc:
+        print(f"Failed to serialize torch.compile artifacts: {exc}")
+        return False
+
+    if not serialized:
+        return False
+
+    artifact_bytes, _cache_info = serialized
+    if not artifact_bytes:
+        return False
+
+    artifact_path = Path(artifact_path)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = artifact_path.with_suffix(artifact_path.suffix + ".tmp")
+    try:
+        temp_path.write_bytes(artifact_bytes)
+        temp_path.replace(artifact_path)
+    except OSError as exc:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(f"Failed to write torch.compile artifacts to {artifact_path}: {exc}")
+        return False
+
+    print(
+        f"Saved torch.compile artifacts to {artifact_path} "
+        f"({len(artifact_bytes) / 1024:.1f} KiB)."
+    )
+    return True

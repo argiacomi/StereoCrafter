@@ -1,5 +1,6 @@
 import gc
 import os
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -12,9 +13,12 @@ from pipelines.stereo_video_inpainting import (
     tensor2vid,
 )
 from torch_runtime_utils import (
+    configure_compile_cache,
     configure_cuda_performance_flags,
     is_cuda_oom,
+    load_compile_artifacts,
     mark_torch_compile_step_begin,
+    save_compile_artifacts,
 )
 from transformers import CLIPVisionModelWithProjection
 
@@ -210,7 +214,19 @@ def main(
     vae_encode_chunk_size=None,
     noise_aug_strength=0.0,
     cpu_offload=None,
+    compile_cache_dir=None,
 ):
+    repo_root = Path(__file__).resolve().parent
+    compile_cache_dir = compile_cache_dir or os.environ.get(
+        "TORCHINDUCTOR_CACHE_DIR",
+        str(repo_root / ".torch_compile_cache" / "inpainting"),
+    )
+    compile_cache_dir = configure_compile_cache(compile_cache_dir)
+    compile_artifact_path = os.path.join(
+        compile_cache_dir, "inpainting_compile_artifacts.bin"
+    )
+    load_compile_artifacts(compile_artifact_path)
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for stereo video inpainting.")
     if frames_chunk <= overlap:
@@ -416,6 +432,7 @@ def main(
     finally:
         sbs_writer.release()
         anaglyph_writer.release()
+        save_compile_artifacts(compile_artifact_path)
 
 
 if __name__ == "__main__":
