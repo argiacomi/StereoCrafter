@@ -3,3 +3,4 @@ __pycache__/
 outputs/*
 weights/*
 .torch_compile_cache/
+.claude

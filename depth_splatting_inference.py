@@ -150,6 +150,23 @@ def iter_batch_ranges(total_frames, batch_size):
         yield start, min(start + batch_size, total_frames)
 
 
+def shrink_temporal_window(window_size, overlap):
+    if window_size <= 1:
+        return None, None
+
+    next_window_size = max(1, window_size // 2)
+    if next_window_size == window_size:
+        next_window_size = window_size - 1
+
+    if next_window_size <= 1:
+        next_overlap = 0
+    else:
+        scaled_overlap = int(round(overlap * next_window_size / window_size))
+        next_overlap = min(next_window_size - 1, max(0, scaled_overlap))
+
+    return next_window_size, next_overlap
+
+
 def write_video_opencv(input_frames, fps, output_video_path):
     num_frames = len(input_frames)
     height, width, _ = input_frames[0].shape
@@ -284,6 +301,8 @@ class DepthCrafterDemo:
             restore_compiled_unet = self.pipe.unet
             self.pipe.unet = self._eager_unet
 
+        current_window_size = max(1, int(window_size))
+        current_overlap = max(0, int(overlap))
         current_decode_chunk_size = decode_chunk_size
         try:
             with torch.inference_mode():
@@ -298,12 +317,17 @@ class DepthCrafterDemo:
                             output_type="np",
                             guidance_scale=guidance_scale,
                             num_inference_steps=num_denoising_steps,
-                            window_size=window_size,
-                            overlap=overlap,
+                            window_size=current_window_size,
+                            overlap=current_overlap,
                             decode_chunk_size=current_decode_chunk_size,
                             track_time=track_time,
                         ).frames[0]
-                        return chunk_depth, current_decode_chunk_size
+                        return (
+                            chunk_depth,
+                            current_decode_chunk_size,
+                            current_window_size,
+                            current_overlap,
+                        )
                     except Exception as exc:
                         if use_compiled_unet and is_torch_compile_failure(exc):
                             print(
@@ -345,6 +369,23 @@ class DepthCrafterDemo:
                                     f"retrying with decode_chunk_size={next_decode_chunk_size}."
                                 )
                                 current_decode_chunk_size = next_decode_chunk_size
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                continue
+
+                            next_window_size, next_overlap = shrink_temporal_window(
+                                current_window_size, current_overlap
+                            )
+                            if next_window_size is not None:
+                                print(
+                                    "DepthCrafter hit CUDA OOM after exhausting "
+                                    "decode chunk retries; retrying with "
+                                    f"window_size={next_window_size}, "
+                                    f"overlap={next_overlap}."
+                                )
+                                current_window_size = next_window_size
+                                current_overlap = next_overlap
                                 gc.collect()
                                 if torch.cuda.is_available():
                                     torch.cuda.empty_cache()
@@ -402,6 +443,8 @@ class DepthCrafterDemo:
         device = self.pipe._execution_device
         chunk_size = max(window_size, overlap + 1)
         chunk_ranges = list(iter_window_ranges(num_frames, chunk_size, overlap))
+        current_window_size = max(1, int(window_size))
+        current_window_overlap = max(0, int(overlap))
         current_decode_chunk_size = max(1, int(decode_chunk_size))
         compiled_chunk_length = chunk_ranges[0][1] - chunk_ranges[0][0]
         tail_chunk_warned = False
@@ -418,12 +461,17 @@ class DepthCrafterDemo:
                 "Warming up torch.compile on the canonical depth chunk shape "
                 f"({len(warmup_indices)} frames)."
             )
-            warmup_depth, current_decode_chunk_size = self._run_depthcrafter_chunk(
+            (
+                warmup_depth,
+                current_decode_chunk_size,
+                current_window_size,
+                current_window_overlap,
+            ) = self._run_depthcrafter_chunk(
                 warmup_frames,
                 guidance_scale=guidance_scale,
                 num_denoising_steps=num_denoising_steps,
-                window_size=window_size,
-                overlap=overlap,
+                window_size=current_window_size,
+                overlap=current_window_overlap,
                 decode_chunk_size=current_decode_chunk_size,
                 track_time=track_time,
                 use_compiled_unet=True,
@@ -457,12 +505,17 @@ class DepthCrafterDemo:
                         )
                         tail_chunk_warned = True
 
-                chunk_depth, current_decode_chunk_size = self._run_depthcrafter_chunk(
+                (
+                    chunk_depth,
+                    current_decode_chunk_size,
+                    current_window_size,
+                    current_window_overlap,
+                ) = self._run_depthcrafter_chunk(
                     frames,
                     guidance_scale=guidance_scale,
                     num_denoising_steps=num_denoising_steps,
-                    window_size=window_size,
-                    overlap=overlap,
+                    window_size=current_window_size,
+                    overlap=current_window_overlap,
                     decode_chunk_size=current_decode_chunk_size,
                     track_time=track_time,
                     use_compiled_unet=use_compiled_unet,
