@@ -188,13 +188,15 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         do_classifier_free_guidance,
         n_frames_per_time=5,
     ):
-        frames = frames.to(device=device) # f c h w
+        n_frames_per_time = max(1, int(n_frames_per_time))
 
         latent_list = []
-        for i in range(0,frames.shape[0],n_frames_per_time):
-            frame_latent = self.vae.encode(frames[i:i+n_frames_per_time]).latent_dist.mode()
+        for i in range(0, frames.shape[0], n_frames_per_time):
+            frame_chunk = frames[i : i + n_frames_per_time].to(device=device)
+            frame_latent = self.vae.encode(frame_chunk).latent_dist.mode()
             latent_list.append(frame_latent)
-        frame_latents = torch.cat(latent_list,dim=0).unsqueeze(0)
+            del frame_chunk
+        frame_latents = torch.cat(latent_list, dim=0).unsqueeze(0)
 
         if do_classifier_free_guidance:
             negative_frame_latents = torch.zeros_like(frame_latents)

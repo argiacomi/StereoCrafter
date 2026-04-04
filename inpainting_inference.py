@@ -25,6 +25,22 @@ from transformers import CLIPVisionModelWithProjection
 configure_cuda_performance_flags()
 
 
+def try_enable_memory_feature(method_owner, method_name, feature_name, component_name):
+    method = getattr(method_owner, method_name, None)
+    if not callable(method):
+        return False
+
+    try:
+        method()
+        return True
+    except NotImplementedError:
+        print(
+            f"Skipping {component_name} {feature_name}: "
+            f"{component_name} does not implement it."
+        )
+        return False
+
+
 def spatial_tile_shape(height, width, tile_num, tile_overlap=(128, 128)):
     tile_size = (
         int((height + tile_overlap[0] * (tile_num - 1)) / tile_num),
@@ -235,6 +251,11 @@ def main(
         )
     if tile_num < 1:
         raise ValueError(f"`tile_num` must be at least 1, but got {tile_num}.")
+    if vae_encode_chunk_size is not None and vae_encode_chunk_size < 1:
+        raise ValueError(
+            "`vae_encode_chunk_size` must be at least 1, "
+            f"but got {vae_encode_chunk_size}."
+        )
 
     decode_chunk_size = min(decode_chunk_size or frames_chunk, frames_chunk)
 
@@ -281,8 +302,10 @@ def main(
             f"Unknown cpu_offload mode '{cpu_offload}'. Expected None, 'sequential', or 'model'."
         )
 
-    if tile_num > 1 and hasattr(pipeline.vae, "enable_tiling"):
-        pipeline.vae.enable_tiling()
+    vae_name = pipeline.vae.__class__.__name__
+    try_enable_memory_feature(pipeline.vae, "enable_slicing", "slicing", vae_name)
+    if tile_num > 1:
+        try_enable_memory_feature(pipeline.vae, "enable_tiling", "tiling", vae_name)
 
     os.makedirs(save_dir, exist_ok=True)
     video_name = (
@@ -317,6 +340,7 @@ def main(
     generated_context = None
     step = frames_chunk - overlap
     current_tile_num = tile_num
+    current_vae_encode_chunk_size = max(1, int(vae_encode_chunk_size or 5))
 
     try:
         with torch.inference_mode():
@@ -373,23 +397,52 @@ def main(
                             motion_bucket_id=127,
                             noise_aug_strength=noise_aug_strength,
                             num_inference_steps=num_inference_steps,
-                            vae_encode_chunk_size=vae_encode_chunk_size,
+                            vae_encode_chunk_size=current_vae_encode_chunk_size,
                         )
                         break
                     except Exception as exc:
-                        if is_cuda_oom(exc) and current_tile_num < max_tile_num:
-                            next_tile_num = current_tile_num + 1
-                            print(
-                                "Spatial tiling hit CUDA OOM; "
-                                f"retrying with tile_num={next_tile_num}."
-                            )
-                            current_tile_num = next_tile_num
-                            if hasattr(pipeline.vae, "enable_tiling"):
-                                pipeline.vae.enable_tiling()
+                        if is_cuda_oom(exc):
+                            if current_vae_encode_chunk_size > 1:
+                                next_vae_encode_chunk_size = max(
+                                    1, current_vae_encode_chunk_size // 2
+                                )
+                                if next_vae_encode_chunk_size == current_vae_encode_chunk_size:
+                                    next_vae_encode_chunk_size = (
+                                        current_vae_encode_chunk_size - 1
+                                    )
+                                print(
+                                    "Inpainting hit CUDA OOM; "
+                                    "retrying with "
+                                    f"vae_encode_chunk_size={next_vae_encode_chunk_size}."
+                                )
+                                current_vae_encode_chunk_size = next_vae_encode_chunk_size
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                continue
+
+                            if current_tile_num < max_tile_num:
+                                next_tile_num = current_tile_num + 1
+                                print(
+                                    "Inpainting hit CUDA OOM after exhausting "
+                                    "VAE encode chunk retries; "
+                                    f"retrying with tile_num={next_tile_num}."
+                                )
+                                current_tile_num = next_tile_num
+                                try_enable_memory_feature(
+                                    pipeline.vae,
+                                    "enable_tiling",
+                                    "tiling",
+                                    vae_name,
+                                )
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                continue
+
                             gc.collect()
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
-                            continue
                         raise
 
                 video_latents = video_latents.unsqueeze(0)
