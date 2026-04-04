@@ -22,6 +22,7 @@ from torch_runtime_utils import (
     mark_torch_compile_step_begin,
     save_compile_artifacts,
 )
+from tqdm import tqdm
 from transformers import CLIPVisionModelWithProjection
 
 configure_cuda_performance_flags()
@@ -346,12 +347,12 @@ def main(
     step = frames_chunk - overlap
     current_tile_num = tile_num
     current_vae_encode_chunk_size = max(1, int(vae_encode_chunk_size or 5))
+    chunk_starts = [i for i in range(0, num_frames, step) if i + overlap < num_frames]
 
     try:
         with torch.inference_mode():
-            for i in range(0, num_frames, step):
-                if i + overlap >= num_frames:
-                    break
+            pipeline.set_progress_bar_config(disable=True)
+            for i in tqdm(chunk_starts, desc="Stereo inpainting", unit="chunk"):
 
                 if generated_context is not None and i + frames_chunk > num_frames:
                     cur_i = max(num_frames + overlap - frames_chunk, 0)
