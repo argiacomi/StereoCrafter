@@ -70,6 +70,13 @@ def is_cuda_oom(exc):
     return "out of memory" in str(exc).lower()
 
 
+def is_cuda_invalid_argument(exc):
+    accelerator_error = getattr(torch, "AcceleratorError", None)
+    if accelerator_error is not None and isinstance(exc, accelerator_error):
+        return "invalid argument" in str(exc).lower()
+    return "cuda error: invalid argument" in str(exc).lower()
+
+
 def configure_compile_cache(cache_dir):
     cache_path = Path(cache_dir).expanduser().resolve()
     cache_path.mkdir(parents=True, exist_ok=True)

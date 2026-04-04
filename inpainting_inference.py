@@ -15,7 +15,9 @@ from pipelines.stereo_video_inpainting import (
 from torch_runtime_utils import (
     configure_compile_cache,
     configure_cuda_performance_flags,
+    is_cuda_invalid_argument,
     is_cuda_oom,
+    is_torch_compile_failure,
     load_compile_artifacts,
     mark_torch_compile_step_begin,
     save_compile_artifacts,
@@ -289,9 +291,12 @@ def main(
         torch_dtype=torch.float16,
     )
 
+    eager_unet = pipeline.unet
+    use_compiled_unet = False
     if cpu_offload is None:
         pipeline = pipeline.to("cuda")
         pipeline.unet = torch.compile(pipeline.unet, mode="default")
+        use_compiled_unet = True
         pipeline.vae.decoder = torch.compile(pipeline.vae.decoder, mode="default")
     elif cpu_offload == "sequential":
         pipeline.enable_sequential_cpu_offload()
@@ -383,7 +388,7 @@ def main(
 
                 while True:
                     try:
-                        if cpu_offload is None:
+                        if use_compiled_unet:
                             mark_torch_compile_step_begin()
                         video_latents = spatial_tiled_process(
                             input_frames_i,
@@ -401,7 +406,43 @@ def main(
                         )
                         break
                     except Exception as exc:
+                        if use_compiled_unet and is_torch_compile_failure(exc):
+                            print(
+                                "torch.compile failed for the inpainting UNet; "
+                                "falling back to eager execution."
+                            )
+                            pipeline.unet = eager_unet
+                            use_compiled_unet = False
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+
+                        if use_compiled_unet and is_cuda_invalid_argument(exc):
+                            print(
+                                "Compiled inpainting UNet hit CUDA invalid argument; "
+                                "falling back to eager execution."
+                            )
+                            pipeline.unet = eager_unet
+                            use_compiled_unet = False
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+
                         if is_cuda_oom(exc):
+                            if use_compiled_unet:
+                                print(
+                                    "Inpainting hit CUDA OOM with a compiled UNet; "
+                                    "retrying in eager mode."
+                                )
+                                pipeline.unet = eager_unet
+                                use_compiled_unet = False
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                continue
+
                             if current_vae_encode_chunk_size > 1:
                                 next_vae_encode_chunk_size = max(
                                     1, current_vae_encode_chunk_size // 2
