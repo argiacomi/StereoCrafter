@@ -254,6 +254,10 @@ def main(
         )
     if tile_num < 1:
         raise ValueError(f"`tile_num` must be at least 1, but got {tile_num}.")
+    if decode_chunk_size is not None and decode_chunk_size < 1:
+        raise ValueError(
+            f"`decode_chunk_size` must be at least 1, but got {decode_chunk_size}."
+        )
     if vae_encode_chunk_size is not None and vae_encode_chunk_size < 1:
         raise ValueError(
             "`vae_encode_chunk_size` must be at least 1, "
@@ -293,12 +297,15 @@ def main(
     )
 
     eager_unet = pipeline.unet
+    eager_vae_decoder = pipeline.vae.decoder
     use_compiled_unet = False
+    use_compiled_vae_decoder = False
     if cpu_offload is None:
         pipeline = pipeline.to("cuda")
         pipeline.unet = torch.compile(pipeline.unet, mode="default")
         use_compiled_unet = True
         pipeline.vae.decoder = torch.compile(pipeline.vae.decoder, mode="default")
+        use_compiled_vae_decoder = True
     elif cpu_offload == "sequential":
         pipeline.enable_sequential_cpu_offload()
     elif cpu_offload == "model":
@@ -346,6 +353,7 @@ def main(
     generated_context = None
     step = frames_chunk - overlap
     current_tile_num = tile_num
+    current_decode_chunk_size = decode_chunk_size
     current_vae_encode_chunk_size = max(1, int(vae_encode_chunk_size or 5))
     chunk_starts = [i for i in range(0, num_frames, step) if i + overlap < num_frames]
 
@@ -496,13 +504,76 @@ def main(
                 elif pipeline.vae.dtype != video_latents.dtype:
                     pipeline.vae.to(dtype=video_latents.dtype)
 
-                if cpu_offload is None:
-                    mark_torch_compile_step_begin()
-                video_frames = pipeline.decode_latents(
-                    video_latents,
-                    num_frames=video_latents.shape[1],
-                    decode_chunk_size=decode_chunk_size,
-                )
+                while True:
+                    try:
+                        if use_compiled_vae_decoder:
+                            mark_torch_compile_step_begin()
+                        video_frames = pipeline.decode_latents(
+                            video_latents,
+                            num_frames=video_latents.shape[1],
+                            decode_chunk_size=current_decode_chunk_size,
+                        )
+                        break
+                    except Exception as exc:
+                        if use_compiled_vae_decoder and is_torch_compile_failure(exc):
+                            print(
+                                "torch.compile failed for the inpainting VAE decoder; "
+                                "falling back to eager execution."
+                            )
+                            pipeline.vae.decoder = eager_vae_decoder
+                            use_compiled_vae_decoder = False
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+
+                        if use_compiled_vae_decoder and is_cuda_invalid_argument(exc):
+                            print(
+                                "Compiled inpainting VAE decoder hit CUDA invalid argument; "
+                                "falling back to eager execution."
+                            )
+                            pipeline.vae.decoder = eager_vae_decoder
+                            use_compiled_vae_decoder = False
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+
+                        if is_cuda_oom(exc):
+                            if use_compiled_vae_decoder:
+                                print(
+                                    "Inpainting hit CUDA OOM with a compiled VAE decoder; "
+                                    "retrying in eager mode."
+                                )
+                                pipeline.vae.decoder = eager_vae_decoder
+                                use_compiled_vae_decoder = False
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                continue
+
+                            if current_decode_chunk_size > 1:
+                                next_decode_chunk_size = max(
+                                    1, current_decode_chunk_size // 2
+                                )
+                                if next_decode_chunk_size == current_decode_chunk_size:
+                                    next_decode_chunk_size = (
+                                        current_decode_chunk_size - 1
+                                    )
+                                print(
+                                    "Inpainting hit CUDA OOM during VAE decode; "
+                                    f"retrying with decode_chunk_size={next_decode_chunk_size}."
+                                )
+                                current_decode_chunk_size = next_decode_chunk_size
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                continue
+
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        raise
                 video_frames = tensor2vid(
                     video_frames, pipeline.image_processor, output_type="np"
                 )[0]
