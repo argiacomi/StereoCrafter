@@ -77,6 +77,26 @@ def is_cuda_invalid_argument(exc):
     return "cuda error: invalid argument" in str(exc).lower()
 
 
+def force_math_sdpa():
+    cuda_backends = getattr(torch.backends, "cuda", None)
+    if cuda_backends is None:
+        return False
+
+    changed = False
+    for method_name, enabled in (
+        ("enable_flash_sdp", False),
+        ("enable_mem_efficient_sdp", False),
+        ("enable_cudnn_sdp", False),
+        ("enable_math_sdp", True),
+    ):
+        method = getattr(cuda_backends, method_name, None)
+        if callable(method):
+            method(enabled)
+            changed = True
+
+    return changed
+
+
 def configure_compile_cache(cache_dir):
     cache_path = Path(cache_dir).expanduser().resolve()
     cache_path.mkdir(parents=True, exist_ok=True)

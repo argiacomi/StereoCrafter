@@ -15,6 +15,7 @@ from pipelines.stereo_video_inpainting import (
 from torch_runtime_utils import (
     configure_compile_cache,
     configure_cuda_performance_flags,
+    force_math_sdpa,
     is_cuda_invalid_argument,
     is_cuda_oom,
     is_torch_compile_failure,
@@ -388,6 +389,7 @@ def main(
     )
     tail_chunk_warned = False
     warmed_chunk = None
+    math_sdpa_forced = False
 
     def run_inpainting_chunk(
         input_frames_i,
@@ -400,6 +402,7 @@ def main(
         nonlocal current_decode_chunk_size
         nonlocal current_tile_num
         nonlocal current_vae_encode_chunk_size
+        nonlocal math_sdpa_forced
 
         use_compiled_unet = (
             compiled_unet_available and use_compiled_unet_for_chunk
@@ -465,6 +468,18 @@ def main(
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                         continue
+
+                    if is_cuda_invalid_argument(exc) and not math_sdpa_forced:
+                        if force_math_sdpa():
+                            print(
+                                "Inpainting UNet SDPA hit CUDA invalid argument; "
+                                "retrying with math attention kernels."
+                            )
+                            math_sdpa_forced = True
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
 
                     if is_cuda_oom(exc):
                         if use_compiled_unet:
