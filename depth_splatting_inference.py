@@ -671,6 +671,16 @@ def DepthSplatting(
         video_plan["fps"],
         (width * 2, height * 2),
     )
+    sbs_output_video_path = os.path.join(
+        os.path.dirname(output_video_path) or ".",
+        f"{Path(video_plan['video_path']).stem}_sbs.mp4",
+    )
+    sbs_out = create_video_writer(
+        sbs_output_video_path,
+        video_plan["fps"],
+        width * 2,
+        height,
+    )
 
     try:
         with torch.inference_mode():
@@ -744,6 +754,15 @@ def DepthSplatting(
                             video_grid_bgr = cv2.cvtColor(video_grid_uint8, cv2.COLOR_RGB2BGR)
                             out.write(video_grid_bgr)
 
+                            sbs_video = np.concatenate(
+                                [batch_frames[j], right_video[j]], axis=1
+                            )
+                            sbs_uint8 = np.clip(sbs_video * 255.0, 0, 255).astype(
+                                np.uint8
+                            )
+                            sbs_bgr = cv2.cvtColor(sbs_uint8, cv2.COLOR_RGB2BGR)
+                            sbs_out.write(sbs_bgr)
+
                         processed_frames = len(batch_indices)
                         frame_offset += processed_frames
                         progress_bar.update(processed_frames)
@@ -766,6 +785,7 @@ def DepthSplatting(
                         del left_video, disp_map, right_video, occlusion_mask
     finally:
         out.release()
+        sbs_out.release()
 
 
 def main(

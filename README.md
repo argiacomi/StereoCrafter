@@ -122,7 +122,11 @@ Arguments:
 
 Depth inference keeps the compiled path on the dominant full-size chunk shape and runs the undersized tail chunk eagerly to avoid a second recompilation/autotuning pass.
 
-The first step generates a video grid with input video, visualized depth map, occlusion mask, and splatting right video, as shown below:
+The first step generates:
+- the video grid at `--output_video_path`, containing the input video, visualized depth map, occlusion mask, and splatting right video
+- an additional side-by-side video named `<input basename>_sbs.mp4` in the output directory, containing the left frame and warped frame
+
+The grid output looks like this:
 
 <img src="assets/camel_splatting_results.jpg" alt="camel_splatting_results" width="800"/> 
 
