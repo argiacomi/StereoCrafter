@@ -550,10 +550,12 @@ class DepthCrafterDemo:
         raw_depth = np.load(raw_depth_path, mmap_mode="r+")
         depth_min = np.inf
         depth_max = -np.inf
-        for start, stop in iter_batch_ranges(num_frames, 64):
-            batch = raw_depth[start:stop]
-            depth_min = min(depth_min, float(batch.min()))
-            depth_max = max(depth_max, float(batch.max()))
+        with tqdm(total=num_frames, desc="Depth extrema scan", unit="frame") as progress_bar:
+            for start, stop in iter_batch_ranges(num_frames, 64):
+                batch = raw_depth[start:stop]
+                depth_min = min(depth_min, float(batch.min()))
+                depth_max = max(depth_max, float(batch.max()))
+                progress_bar.update(stop - start)
 
         depth_vis_writer = None
         if save_depth:
@@ -564,18 +566,21 @@ class DepthCrafterDemo:
                 original_height,
             )
 
-        for start, stop in iter_batch_ranges(num_frames, 64):
-            normalized_batch = normalize_depth_batch(
-                raw_depth[start:stop], depth_min, depth_max
-            )
-            raw_depth[start:stop] = normalized_batch
+        with tqdm(total=num_frames, desc="Depth normalization", unit="frame") as progress_bar:
+            for start, stop in iter_batch_ranges(num_frames, 64):
+                normalized_batch = normalize_depth_batch(
+                    raw_depth[start:stop], depth_min, depth_max
+                )
+                raw_depth[start:stop] = normalized_batch
 
-            if depth_vis_writer is not None:
-                depth_vis = np.clip(
-                    vis_sequence_depth(normalized_batch) * 255.0, 0, 255
-                ).astype(np.uint8)
-                for frame in depth_vis:
-                    depth_vis_writer.write(frame[:, :, ::-1])
+                if depth_vis_writer is not None:
+                    depth_vis = np.clip(
+                        vis_sequence_depth(normalized_batch) * 255.0, 0, 255
+                    ).astype(np.uint8)
+                    for frame in depth_vis:
+                        depth_vis_writer.write(frame[:, :, ::-1])
+
+                progress_bar.update(stop - start)
 
         if depth_vis_writer is not None:
             depth_vis_writer.release()
@@ -670,92 +675,95 @@ def DepthSplatting(
     try:
         with torch.inference_mode():
             frame_offset = 0
-            while frame_offset < num_frames:
-                left_video = None
-                disp_map = None
-                right_video = None
-                occlusion_mask = None
-                try:
-                    batch_indices = video_plan["frame_indices"][
-                        frame_offset : frame_offset + current_batch_size
-                    ]
-                    batch_frames = (
-                        vid_reader.get_batch(batch_indices).asnumpy().astype(np.float32)
-                        / 255.0
-                    )
-                    # Copy the memmap slice so torch.from_numpy receives writable storage.
-                    batch_depth = np.array(
-                        video_depth[frame_offset : frame_offset + current_batch_size],
-                        dtype=np.float32,
-                        copy=True,
-                    )
-                    batch_depth_vis = vis_sequence_depth(batch_depth)
-
-                    left_video = (
-                        torch.from_numpy(batch_frames)
-                        .permute(0, 3, 1, 2)
-                        .contiguous()
-                        .pin_memory()
-                        .cuda(non_blocking=True)
-                    )
-                    disp_map = (
-                        torch.from_numpy(batch_depth)
-                        .float()
-                        .unsqueeze(1)
-                        .pin_memory()
-                        .cuda(non_blocking=True)
-                    )
-
-                    disp_map = disp_map * 2.0 - 1.0
-                    disp_map = disp_map * max_disp
-
-                    right_video, occlusion_mask = stereo_projector(
-                        left_video, disp_map
-                    )
-
-                    right_video = right_video.cpu().permute(0, 2, 3, 1).numpy()
-                    occlusion_mask = (
-                        occlusion_mask.cpu()
-                        .permute(0, 2, 3, 1)
-                        .numpy()
-                        .repeat(3, axis=-1)
-                    )
-
-                    for j in range(len(batch_frames)):
-                        video_grid_top = np.concatenate(
-                            [batch_frames[j], batch_depth_vis[j]], axis=1
+            with tqdm(total=num_frames, desc="Stereo splatting", unit="frame") as progress_bar:
+                while frame_offset < num_frames:
+                    left_video = None
+                    disp_map = None
+                    right_video = None
+                    occlusion_mask = None
+                    try:
+                        batch_indices = video_plan["frame_indices"][
+                            frame_offset : frame_offset + current_batch_size
+                        ]
+                        batch_frames = (
+                            vid_reader.get_batch(batch_indices).asnumpy().astype(np.float32)
+                            / 255.0
                         )
-                        video_grid_bottom = np.concatenate(
-                            [occlusion_mask[j], right_video[j]], axis=1
+                        # Copy the memmap slice so torch.from_numpy receives writable storage.
+                        batch_depth = np.array(
+                            video_depth[frame_offset : frame_offset + current_batch_size],
+                            dtype=np.float32,
+                            copy=True,
                         )
-                        video_grid = np.concatenate(
-                            [video_grid_top, video_grid_bottom], axis=0
+                        batch_depth_vis = vis_sequence_depth(batch_depth)
+
+                        left_video = (
+                            torch.from_numpy(batch_frames)
+                            .permute(0, 3, 1, 2)
+                            .contiguous()
+                            .pin_memory()
+                            .cuda(non_blocking=True)
+                        )
+                        disp_map = (
+                            torch.from_numpy(batch_depth)
+                            .float()
+                            .unsqueeze(1)
+                            .pin_memory()
+                            .cuda(non_blocking=True)
                         )
 
-                        video_grid_uint8 = np.clip(video_grid * 255.0, 0, 255).astype(
-                            np.uint8
-                        )
-                        video_grid_bgr = cv2.cvtColor(video_grid_uint8, cv2.COLOR_RGB2BGR)
-                        out.write(video_grid_bgr)
+                        disp_map = disp_map * 2.0 - 1.0
+                        disp_map = disp_map * max_disp
 
-                    frame_offset += len(batch_indices)
-                except Exception as exc:
-                    if is_cuda_oom(exc) and current_batch_size > 1:
-                        next_batch_size = max(1, current_batch_size // 2)
-                        if next_batch_size == current_batch_size:
-                            next_batch_size = current_batch_size - 1
-                        print(
-                            "Stereo splatting hit CUDA OOM; "
-                            f"retrying with batch_size={next_batch_size}."
+                        right_video, occlusion_mask = stereo_projector(
+                            left_video, disp_map
                         )
-                        current_batch_size = next_batch_size
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        continue
-                    raise
-                finally:
-                    del left_video, disp_map, right_video, occlusion_mask
+
+                        right_video = right_video.cpu().permute(0, 2, 3, 1).numpy()
+                        occlusion_mask = (
+                            occlusion_mask.cpu()
+                            .permute(0, 2, 3, 1)
+                            .numpy()
+                            .repeat(3, axis=-1)
+                        )
+
+                        for j in range(len(batch_frames)):
+                            video_grid_top = np.concatenate(
+                                [batch_frames[j], batch_depth_vis[j]], axis=1
+                            )
+                            video_grid_bottom = np.concatenate(
+                                [occlusion_mask[j], right_video[j]], axis=1
+                            )
+                            video_grid = np.concatenate(
+                                [video_grid_top, video_grid_bottom], axis=0
+                            )
+
+                            video_grid_uint8 = np.clip(video_grid * 255.0, 0, 255).astype(
+                                np.uint8
+                            )
+                            video_grid_bgr = cv2.cvtColor(video_grid_uint8, cv2.COLOR_RGB2BGR)
+                            out.write(video_grid_bgr)
+
+                        processed_frames = len(batch_indices)
+                        frame_offset += processed_frames
+                        progress_bar.update(processed_frames)
+                    except Exception as exc:
+                        if is_cuda_oom(exc) and current_batch_size > 1:
+                            next_batch_size = max(1, current_batch_size // 2)
+                            if next_batch_size == current_batch_size:
+                                next_batch_size = current_batch_size - 1
+                            print(
+                                "Stereo splatting hit CUDA OOM; "
+                                f"retrying with batch_size={next_batch_size}."
+                            )
+                            current_batch_size = next_batch_size
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+                        raise
+                    finally:
+                        del left_video, disp_map, right_video, occlusion_mask
     finally:
         out.release()
 
