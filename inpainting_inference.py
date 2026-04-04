@@ -234,6 +234,7 @@ def main(
     noise_aug_strength=0.0,
     cpu_offload=None,
     compile_cache_dir=None,
+    compile_warmup=True,
 ):
     repo_root = Path(__file__).resolve().parent
     compile_cache_dir = compile_cache_dir or os.environ.get(
@@ -298,14 +299,18 @@ def main(
 
     eager_unet = pipeline.unet
     eager_vae_decoder = pipeline.vae.decoder
-    use_compiled_unet = False
-    use_compiled_vae_decoder = False
+    compiled_unet = None
+    compiled_vae_decoder = None
+    compiled_unet_available = False
+    compiled_vae_decoder_available = False
     if cpu_offload is None:
         pipeline = pipeline.to("cuda")
         pipeline.unet = torch.compile(pipeline.unet, mode="default")
-        use_compiled_unet = True
+        compiled_unet = pipeline.unet
+        compiled_unet_available = True
         pipeline.vae.decoder = torch.compile(pipeline.vae.decoder, mode="default")
-        use_compiled_vae_decoder = True
+        compiled_vae_decoder = pipeline.vae.decoder
+        compiled_vae_decoder_available = True
     elif cpu_offload == "sequential":
         pipeline.enable_sequential_cpu_offload()
     elif cpu_offload == "model":
@@ -355,228 +360,358 @@ def main(
     current_tile_num = tile_num
     current_decode_chunk_size = decode_chunk_size
     current_vae_encode_chunk_size = max(1, int(vae_encode_chunk_size or 5))
-    chunk_starts = [i for i in range(0, num_frames, step) if i + overlap < num_frames]
+    chunk_infos = []
+    for chunk_index, start_i in enumerate(range(0, num_frames, step)):
+        if start_i + overlap >= num_frames:
+            break
+
+        if chunk_index > 0 and start_i + frames_chunk > num_frames:
+            cur_i = max(num_frames + overlap - frames_chunk, 0)
+            cur_overlap = start_i - cur_i + overlap
+        else:
+            cur_i = start_i
+            cur_overlap = overlap
+
+        stop_i = min(cur_i + frames_chunk, num_frames)
+        chunk_infos.append(
+            {
+                "start_i": start_i,
+                "cur_i": cur_i,
+                "stop_i": stop_i,
+                "cur_overlap": cur_overlap,
+                "frame_count": stop_i - cur_i,
+            }
+        )
+
+    compiled_chunk_length = (
+        chunk_infos[0]["frame_count"] if chunk_infos else None
+    )
+    tail_chunk_warned = False
+    warmed_chunk = None
+
+    def run_inpainting_chunk(
+        input_frames_i,
+        frames_mask,
+        use_compiled_unet_for_chunk,
+        use_compiled_vae_decoder_for_chunk,
+    ):
+        nonlocal compiled_unet_available
+        nonlocal compiled_vae_decoder_available
+        nonlocal current_decode_chunk_size
+        nonlocal current_tile_num
+        nonlocal current_vae_encode_chunk_size
+
+        use_compiled_unet = (
+            compiled_unet_available and use_compiled_unet_for_chunk
+        )
+        use_compiled_vae_decoder = (
+            compiled_vae_decoder_available and use_compiled_vae_decoder_for_chunk
+        )
+        restore_compiled_unet = (
+            compiled_unet_available and not use_compiled_unet
+        )
+        restore_compiled_vae_decoder = (
+            compiled_vae_decoder_available and not use_compiled_vae_decoder
+        )
+
+        if restore_compiled_unet:
+            pipeline.unet = eager_unet
+        if restore_compiled_vae_decoder:
+            pipeline.vae.decoder = eager_vae_decoder
+
+        try:
+            while True:
+                try:
+                    if use_compiled_unet:
+                        mark_torch_compile_step_begin()
+                    video_latents = spatial_tiled_process(
+                        input_frames_i,
+                        frames_mask,
+                        pipeline,
+                        current_tile_num,
+                        spatial_n_compress=8,
+                        min_guidance_scale=guidance_scale,
+                        max_guidance_scale=guidance_scale,
+                        fps=7,
+                        motion_bucket_id=127,
+                        noise_aug_strength=noise_aug_strength,
+                        num_inference_steps=num_inference_steps,
+                        vae_encode_chunk_size=current_vae_encode_chunk_size,
+                    )
+                    break
+                except Exception as exc:
+                    if use_compiled_unet and is_torch_compile_failure(exc):
+                        print(
+                            "torch.compile failed for the inpainting UNet; "
+                            "falling back to eager execution."
+                        )
+                        pipeline.unet = eager_unet
+                        compiled_unet_available = False
+                        use_compiled_unet = False
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+
+                    if use_compiled_unet and is_cuda_invalid_argument(exc):
+                        print(
+                            "Compiled inpainting UNet hit CUDA invalid argument; "
+                            "falling back to eager execution."
+                        )
+                        pipeline.unet = eager_unet
+                        compiled_unet_available = False
+                        use_compiled_unet = False
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+
+                    if is_cuda_oom(exc):
+                        if use_compiled_unet:
+                            print(
+                                "Inpainting hit CUDA OOM with a compiled UNet; "
+                                "retrying in eager mode."
+                            )
+                            pipeline.unet = eager_unet
+                            compiled_unet_available = False
+                            use_compiled_unet = False
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+
+                        if current_vae_encode_chunk_size > 1:
+                            next_vae_encode_chunk_size = max(
+                                1, current_vae_encode_chunk_size // 2
+                            )
+                            if next_vae_encode_chunk_size == current_vae_encode_chunk_size:
+                                next_vae_encode_chunk_size = (
+                                    current_vae_encode_chunk_size - 1
+                                )
+                            print(
+                                "Inpainting hit CUDA OOM; "
+                                "retrying with "
+                                f"vae_encode_chunk_size={next_vae_encode_chunk_size}."
+                            )
+                            current_vae_encode_chunk_size = next_vae_encode_chunk_size
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+
+                        if current_tile_num < max_tile_num:
+                            next_tile_num = current_tile_num + 1
+                            print(
+                                "Inpainting hit CUDA OOM after exhausting "
+                                "VAE encode chunk retries; "
+                                f"retrying with tile_num={next_tile_num}."
+                            )
+                            current_tile_num = next_tile_num
+                            try_enable_memory_feature(
+                                pipeline.vae,
+                                "enable_tiling",
+                                "tiling",
+                                vae_name,
+                            )
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    raise
+
+            video_latents = video_latents.unsqueeze(0)
+
+            # Under offload, maybe_free_model_hooks() has moved the VAE
+            # off-device after the pipeline call. Move it back for decoding.
+            if cpu_offload is not None:
+                pipeline.vae.to(
+                    device=pipeline._execution_device, dtype=video_latents.dtype
+                )
+            elif pipeline.vae.dtype != video_latents.dtype:
+                pipeline.vae.to(dtype=video_latents.dtype)
+
+            while True:
+                try:
+                    if use_compiled_vae_decoder:
+                        mark_torch_compile_step_begin()
+                    video_frames = pipeline.decode_latents(
+                        video_latents,
+                        num_frames=video_latents.shape[1],
+                        decode_chunk_size=current_decode_chunk_size,
+                    )
+                    return video_frames
+                except Exception as exc:
+                    if use_compiled_vae_decoder and is_torch_compile_failure(exc):
+                        print(
+                            "torch.compile failed for the inpainting VAE decoder; "
+                            "falling back to eager execution."
+                        )
+                        pipeline.vae.decoder = eager_vae_decoder
+                        compiled_vae_decoder_available = False
+                        use_compiled_vae_decoder = False
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+
+                    if use_compiled_vae_decoder and is_cuda_invalid_argument(exc):
+                        print(
+                            "Compiled inpainting VAE decoder hit CUDA invalid argument; "
+                            "falling back to eager execution."
+                        )
+                        pipeline.vae.decoder = eager_vae_decoder
+                        compiled_vae_decoder_available = False
+                        use_compiled_vae_decoder = False
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+
+                    if is_cuda_oom(exc):
+                        if use_compiled_vae_decoder:
+                            print(
+                                "Inpainting hit CUDA OOM with a compiled VAE decoder; "
+                                "retrying in eager mode."
+                            )
+                            pipeline.vae.decoder = eager_vae_decoder
+                            compiled_vae_decoder_available = False
+                            use_compiled_vae_decoder = False
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+
+                        if current_decode_chunk_size > 1:
+                            next_decode_chunk_size = max(
+                                1, current_decode_chunk_size // 2
+                            )
+                            if next_decode_chunk_size == current_decode_chunk_size:
+                                next_decode_chunk_size = (
+                                    current_decode_chunk_size - 1
+                                )
+                            print(
+                                "Inpainting hit CUDA OOM during VAE decode; "
+                                f"retrying with decode_chunk_size={next_decode_chunk_size}."
+                            )
+                            current_decode_chunk_size = next_decode_chunk_size
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    raise
+        finally:
+            if restore_compiled_unet and compiled_unet_available:
+                pipeline.unet = compiled_unet
+            if restore_compiled_vae_decoder and compiled_vae_decoder_available:
+                pipeline.vae.decoder = compiled_vae_decoder
 
     try:
         with torch.inference_mode():
             pipeline.set_progress_bar_config(disable=True)
-            for i in tqdm(chunk_starts, desc="Stereo inpainting", unit="chunk"):
+            if (
+                compile_warmup
+                and compiled_chunk_length is not None
+                and (compiled_unet_available or compiled_vae_decoder_available)
+            ):
+                warmup_info = chunk_infos[0]
+                print(
+                    "Warming up torch.compile on the canonical inpainting chunk shape "
+                    f"({warmup_info['frame_count']} frames)."
+                )
+                warmup_frames_warpped, warmup_frames_left, warmup_frames_mask = (
+                    load_inpainting_chunk(
+                        video_reader,
+                        warmup_info["cur_i"],
+                        warmup_info["stop_i"],
+                        height,
+                        width,
+                    )
+                )
+                warmup_video_frames = run_inpainting_chunk(
+                    warmup_frames_warpped,
+                    warmup_frames_mask,
+                    use_compiled_unet_for_chunk=compiled_unet_available,
+                    use_compiled_vae_decoder_for_chunk=compiled_vae_decoder_available,
+                )
+                warmed_chunk = (
+                    warmup_info["start_i"],
+                    warmup_frames_left,
+                    tensor2vid(
+                        warmup_video_frames,
+                        pipeline.image_processor,
+                        output_type="np",
+                    )[0],
+                )
 
-                if generated_context is not None and i + frames_chunk > num_frames:
-                    cur_i = max(num_frames + overlap - frames_chunk, 0)
-                    cur_overlap = i - cur_i + overlap
+            for chunk_info in tqdm(
+                chunk_infos, desc="Stereo inpainting", unit="chunk"
+            ):
+                start_i = chunk_info["start_i"]
+                cur_overlap = chunk_info["cur_overlap"]
+
+                if warmed_chunk is not None and warmed_chunk[0] == start_i:
+                    frames_left = warmed_chunk[1]
+                    video_frames = warmed_chunk[2]
+                    warmed_chunk = None
                 else:
-                    cur_i = i
-                    cur_overlap = overlap
+                    frames_warpped, frames_left, frames_mask = load_inpainting_chunk(
+                        video_reader,
+                        chunk_info["cur_i"],
+                        chunk_info["stop_i"],
+                        height,
+                        width,
+                    )
 
-                stop_i = min(cur_i + frames_chunk, num_frames)
-                frames_warpped, frames_left, frames_mask = load_inpainting_chunk(
-                    video_reader,
-                    cur_i,
-                    stop_i,
-                    height,
-                    width,
-                )
+                    input_frames_i = (
+                        frames_warpped.clone()
+                        if generated_context is not None
+                        else frames_warpped
+                    )
 
-                input_frames_i = (
-                    frames_warpped.clone()
-                    if generated_context is not None
-                    else frames_warpped
-                )
+                    if generated_context is not None:
+                        try:
+                            input_frames_i[:cur_overlap] = generated_context[
+                                -cur_overlap:
+                            ].to(dtype=input_frames_i.dtype)
+                        except Exception as e:
+                            print(e)
+                            print(
+                                f"i: {start_i}, cur_i: {chunk_info['cur_i']}, cur_overlap: {cur_overlap}, input_frames_i: {input_frames_i.shape}, generated_context: {generated_context.shape}"
+                            )
 
-                if generated_context is not None:
-                    try:
-                        input_frames_i[:cur_overlap] = generated_context[
-                            -cur_overlap:
-                        ].to(dtype=input_frames_i.dtype)
-                    except Exception as e:
-                        print(e)
+                    use_compiled_chunk = (
+                        compiled_chunk_length is not None
+                        and chunk_info["frame_count"] == compiled_chunk_length
+                    )
+                    if (
+                        (compiled_unet_available or compiled_vae_decoder_available)
+                        and not use_compiled_chunk
+                        and not tail_chunk_warned
+                    ):
                         print(
-                            f"i: {i}, cur_i: {cur_i}, cur_overlap: {cur_overlap}, input_frames_i: {input_frames_i.shape}, generated_context: {generated_context.shape}"
+                            "Skipping torch.compile for the undersized tail inpainting chunk "
+                            f"({chunk_info['frame_count']} vs {compiled_chunk_length} frames) "
+                            "to avoid recompilation/autotuning."
                         )
+                        tail_chunk_warned = True
 
-                while True:
-                    try:
-                        if use_compiled_unet:
-                            mark_torch_compile_step_begin()
-                        video_latents = spatial_tiled_process(
-                            input_frames_i,
-                            frames_mask,
-                            pipeline,
-                            current_tile_num,
-                            spatial_n_compress=8,
-                            min_guidance_scale=guidance_scale,
-                            max_guidance_scale=guidance_scale,
-                            fps=7,
-                            motion_bucket_id=127,
-                            noise_aug_strength=noise_aug_strength,
-                            num_inference_steps=num_inference_steps,
-                            vae_encode_chunk_size=current_vae_encode_chunk_size,
-                        )
-                        break
-                    except Exception as exc:
-                        if use_compiled_unet and is_torch_compile_failure(exc):
-                            print(
-                                "torch.compile failed for the inpainting UNet; "
-                                "falling back to eager execution."
-                            )
-                            pipeline.unet = eager_unet
-                            use_compiled_unet = False
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            continue
-
-                        if use_compiled_unet and is_cuda_invalid_argument(exc):
-                            print(
-                                "Compiled inpainting UNet hit CUDA invalid argument; "
-                                "falling back to eager execution."
-                            )
-                            pipeline.unet = eager_unet
-                            use_compiled_unet = False
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            continue
-
-                        if is_cuda_oom(exc):
-                            if use_compiled_unet:
-                                print(
-                                    "Inpainting hit CUDA OOM with a compiled UNet; "
-                                    "retrying in eager mode."
-                                )
-                                pipeline.unet = eager_unet
-                                use_compiled_unet = False
-                                gc.collect()
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                                continue
-
-                            if current_vae_encode_chunk_size > 1:
-                                next_vae_encode_chunk_size = max(
-                                    1, current_vae_encode_chunk_size // 2
-                                )
-                                if next_vae_encode_chunk_size == current_vae_encode_chunk_size:
-                                    next_vae_encode_chunk_size = (
-                                        current_vae_encode_chunk_size - 1
-                                    )
-                                print(
-                                    "Inpainting hit CUDA OOM; "
-                                    "retrying with "
-                                    f"vae_encode_chunk_size={next_vae_encode_chunk_size}."
-                                )
-                                current_vae_encode_chunk_size = next_vae_encode_chunk_size
-                                gc.collect()
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                                continue
-
-                            if current_tile_num < max_tile_num:
-                                next_tile_num = current_tile_num + 1
-                                print(
-                                    "Inpainting hit CUDA OOM after exhausting "
-                                    "VAE encode chunk retries; "
-                                    f"retrying with tile_num={next_tile_num}."
-                                )
-                                current_tile_num = next_tile_num
-                                try_enable_memory_feature(
-                                    pipeline.vae,
-                                    "enable_tiling",
-                                    "tiling",
-                                    vae_name,
-                                )
-                                gc.collect()
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                                continue
-
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                        raise
-
-                video_latents = video_latents.unsqueeze(0)
-
-                # Under offload, maybe_free_model_hooks() has moved the VAE
-                # off-device after the pipeline call. Move it back for decoding.
-                if cpu_offload is not None:
-                    pipeline.vae.to(device=pipeline._execution_device, dtype=video_latents.dtype)
-                elif pipeline.vae.dtype != video_latents.dtype:
-                    pipeline.vae.to(dtype=video_latents.dtype)
-
-                while True:
-                    try:
-                        if use_compiled_vae_decoder:
-                            mark_torch_compile_step_begin()
-                        video_frames = pipeline.decode_latents(
-                            video_latents,
-                            num_frames=video_latents.shape[1],
-                            decode_chunk_size=current_decode_chunk_size,
-                        )
-                        break
-                    except Exception as exc:
-                        if use_compiled_vae_decoder and is_torch_compile_failure(exc):
-                            print(
-                                "torch.compile failed for the inpainting VAE decoder; "
-                                "falling back to eager execution."
-                            )
-                            pipeline.vae.decoder = eager_vae_decoder
-                            use_compiled_vae_decoder = False
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            continue
-
-                        if use_compiled_vae_decoder and is_cuda_invalid_argument(exc):
-                            print(
-                                "Compiled inpainting VAE decoder hit CUDA invalid argument; "
-                                "falling back to eager execution."
-                            )
-                            pipeline.vae.decoder = eager_vae_decoder
-                            use_compiled_vae_decoder = False
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            continue
-
-                        if is_cuda_oom(exc):
-                            if use_compiled_vae_decoder:
-                                print(
-                                    "Inpainting hit CUDA OOM with a compiled VAE decoder; "
-                                    "retrying in eager mode."
-                                )
-                                pipeline.vae.decoder = eager_vae_decoder
-                                use_compiled_vae_decoder = False
-                                gc.collect()
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                                continue
-
-                            if current_decode_chunk_size > 1:
-                                next_decode_chunk_size = max(
-                                    1, current_decode_chunk_size // 2
-                                )
-                                if next_decode_chunk_size == current_decode_chunk_size:
-                                    next_decode_chunk_size = (
-                                        current_decode_chunk_size - 1
-                                    )
-                                print(
-                                    "Inpainting hit CUDA OOM during VAE decode; "
-                                    f"retrying with decode_chunk_size={next_decode_chunk_size}."
-                                )
-                                current_decode_chunk_size = next_decode_chunk_size
-                                gc.collect()
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                                continue
-
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                        raise
-                video_frames = tensor2vid(
-                    video_frames, pipeline.image_processor, output_type="np"
-                )[0]
+                    video_frames = run_inpainting_chunk(
+                        input_frames_i,
+                        frames_mask,
+                        use_compiled_unet_for_chunk=use_compiled_chunk,
+                        use_compiled_vae_decoder_for_chunk=use_compiled_chunk,
+                    )
+                    video_frames = tensor2vid(
+                        video_frames, pipeline.image_processor, output_type="np"
+                    )[0]
                 video_frames = (
                     torch.from_numpy(video_frames)
                     .permute(0, 3, 1, 2)
@@ -584,8 +719,12 @@ def main(
                     .to(dtype=torch.float32)
                 )
 
-                output_frames = video_frames if i == 0 else video_frames[cur_overlap:]
-                output_left = frames_left if i == 0 else frames_left[cur_overlap:]
+                output_frames = (
+                    video_frames if start_i == 0 else video_frames[cur_overlap:]
+                )
+                output_left = (
+                    frames_left if start_i == 0 else frames_left[cur_overlap:]
+                )
                 write_output_chunk(
                     sbs_writer,
                     anaglyph_writer,

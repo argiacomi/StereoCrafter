@@ -145,6 +145,9 @@ Arguments:
 - `--decode_chunk_size`: The number of frames to decode through the inpainting VAE at once. Lower values reduce peak GPU memory and can avoid unstable compiled-decoder paths during VAE decode. The default value is `frames_chunk`.
 - `--vae_encode_chunk_size`: The number of frames to encode through the inpainting VAE at once. Lower values reduce peak GPU memory during VAE encoding when spatial tiling alone is not enough. The default value is `5`.
 - `--compile_cache_dir`: Optional persistent `torch.compile` cache directory. Default is `./.torch_compile_cache/inpainting`.
+- `--compile_warmup`: Warm up the canonical inpainting chunk shape before the main loop and reuse it. Default is `True`.
+
+Inpainting keeps `torch.compile` on the dominant full-size chunk shape and runs undersized tail chunks eagerly to avoid a second recompilation/autotuning pass.
 
 The stereo video inpainting generates the stereo video result in side-by-side format and anaglyph 3D format, as shown below:
 
