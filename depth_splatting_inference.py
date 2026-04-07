@@ -146,6 +146,8 @@ def build_video_plan(video_path, process_length, target_fps, max_res, dataset="o
 
     vid = VideoReader(video_path, ctx=cpu(0), width=width, height=height)
     resized_height, resized_width = vid[0].shape[:2]
+    model_height = ceil_to_multiple(resized_height, 64)
+    model_width = ceil_to_multiple(resized_width, 64)
 
     src_fps = vid.get_avg_fps()
     if target_fps != -1 and target_fps <= 0:
@@ -820,7 +822,7 @@ def DepthSplatting(
     max_disp,
     batch_size,
     save_raw_sidecars=True,
-    save_debug_video=True,
+    save_debug_video=False,
 ):
     """
     Depth-Based Video Splatting Using the Video Depth.
@@ -864,8 +866,8 @@ def DepthSplatting(
         )
 
     # Lossless raw outputs for the inpainting stage (memory-mapped).
-    # Keyed off the splatting output path so multiple runs from the same source
-    # video don't collide — each splatting MP4 gets its own set of sidecars.
+    # Keyed off the splatting output stem so multiple runs from the same source
+    # video don't collide, even when debug MP4 emission is disabled.
     output_dir = os.path.dirname(output_video_path) or "."
     output_stem = Path(output_video_path).stem  # e.g. "camel_splatting_results"
     raw_left_path = os.path.join(output_dir, f"{output_stem}_raw_left.npy")
@@ -946,12 +948,22 @@ def DepthSplatting(
                             left_video, disp_map
                         )
 
-                        right_video = right_video.cpu().permute(0, 2, 3, 1).numpy()
-                        # Keep single-channel mask for lossless handoff;
-                        # expand to 3-ch only for the debug grid visualization.
+                        right_video = (
+                            right_video.permute(0, 2, 3, 1)
+                            .contiguous()
+                            .to(dtype=torch.float16)
+                            .cpu()
+                            .numpy()
+                        )
+                        # Keep single-channel mask for lossless handoff and
+                        # quantize on-GPU so the CPU transfer stays compact.
                         occlusion_mask_1ch = (
-                            occlusion_mask.cpu()
+                            occlusion_mask.mul(255.0)
+                            .clamp(0.0, 255.0)
+                            .to(dtype=torch.uint8)
                             .permute(0, 2, 3, 1)
+                            .contiguous()
+                            .cpu()
                             .numpy()
                         )
                         batch_len = len(batch_frames)
@@ -961,19 +973,24 @@ def DepthSplatting(
                             mmap_left[frame_offset : frame_offset + batch_len] = np.clip(
                                 batch_frames[:batch_len] * 255.0, 0, 255
                             ).astype(np.uint8)
-                            mmap_right[frame_offset : frame_offset + batch_len] = right_video[:batch_len].astype(np.float16)
-                            mmap_mask[frame_offset : frame_offset + batch_len] = np.clip(
-                                occlusion_mask_1ch[:batch_len] * 255.0, 0, 255
-                            ).astype(np.uint8)
+                            mmap_right[frame_offset : frame_offset + batch_len] = right_video[
+                                :batch_len
+                            ]
+                            mmap_mask[frame_offset : frame_offset + batch_len] = (
+                                occlusion_mask_1ch[:batch_len]
+                            )
 
                         if save_debug_video:
-                            occlusion_mask = occlusion_mask_1ch.repeat(3, axis=-1)
+                            right_video_debug = right_video.astype(np.float32)
+                            occlusion_mask = (
+                                occlusion_mask_1ch.astype(np.float32) / 255.0
+                            ).repeat(3, axis=-1)
                             for j in range(batch_len):
                                 video_grid_top = np.concatenate(
                                     [batch_frames[j], batch_depth_vis[j]], axis=1
                                 )
                                 video_grid_bottom = np.concatenate(
-                                    [occlusion_mask[j], right_video[j]], axis=1
+                                    [occlusion_mask[j], right_video_debug[j]], axis=1
                                 )
                                 video_grid = np.concatenate(
                                     [video_grid_top, video_grid_bottom], axis=0
@@ -982,16 +999,16 @@ def DepthSplatting(
                                 video_grid_uint8 = np.clip(video_grid * 255.0, 0, 255).astype(
                                     np.uint8
                                 )
-                                video_grid_bgr = cv2.cvtColor(video_grid_uint8, cv2.COLOR_RGB2BGR)
+                                video_grid_bgr = video_grid_uint8[:, :, ::-1].copy()
                                 out.write(video_grid_bgr)
 
                                 sbs_video = np.concatenate(
-                                    [batch_frames[j], right_video[j]], axis=1
+                                    [batch_frames[j], right_video_debug[j]], axis=1
                                 )
                                 sbs_uint8 = np.clip(sbs_video * 255.0, 0, 255).astype(
                                     np.uint8
                                 )
-                                sbs_bgr = cv2.cvtColor(sbs_uint8, cv2.COLOR_RGB2BGR)
+                                sbs_bgr = sbs_uint8[:, :, ::-1].copy()
                                 sbs_out.write(sbs_bgr)
 
                         processed_frames = len(batch_indices)
@@ -1070,7 +1087,7 @@ def main(
     track_time: bool = False,
     save_depth: bool = False,
     save_raw_sidecars: bool = True,
-    save_debug_video: bool = True,
+    save_debug_video: bool = False,
     compile_cache_dir: str = None,
     compile_warmup: bool = True,
 ):
