@@ -90,25 +90,48 @@ def build_video_plan(video_path, process_length, target_fps, max_res, dataset="o
         vid = VideoReader(video_path, ctx=cpu(0))
         original_height, original_width = vid[0].shape[:2]
         print("==> original video shape: ", (len(vid), original_height, original_width))
-        height = round(original_height / 64) * 64
-        width = round(original_width / 64) * 64
+        height = (original_height // 64) * 64
+        width = (original_width // 64) * 64
         if max(height, width) > max_res:
             scale = max_res / max(original_height, original_width)
-            height = round(original_height * scale / 64) * 64
-            width = round(original_width * scale / 64) * 64
+            height = (int(original_height * scale) // 64) * 64
+            width = (int(original_width * scale) // 64) * 64
+        # Ensure dimensions are at least 64.
+        height = max(height, 64)
+        width = max(width, 64)
     else:
-        height = dataset_res_dict[dataset][0]
-        width = dataset_res_dict[dataset][1]
+        raise ValueError(
+            f"Unknown dataset '{dataset}'. Only 'open' is supported. "
+            f"For custom resolutions, use --max_res to control sizing."
+        )
 
     vid = VideoReader(video_path, ctx=cpu(0), width=width, height=height)
     resized_height, resized_width = vid[0].shape[:2]
 
-    fps = vid.get_avg_fps() if target_fps == -1 else target_fps
-    stride = round(vid.get_avg_fps() / fps)
-    stride = max(stride, 1)
-    frames_idx = list(range(0, len(vid), stride))
+    src_fps = vid.get_avg_fps()
+    if target_fps != -1 and target_fps <= 0:
+        raise ValueError(
+            f"target_fps must be -1 (keep source) or a positive number, got {target_fps}"
+        )
+    fps = src_fps if target_fps == -1 else target_fps
+    if fps >= src_fps:
+        # Keep all frames when target >= source (no upsampling).
+        frames_idx = list(range(len(vid)))
+        fps = src_fps
+    else:
+        # Subsample by picking the nearest source frame to each target timestamp.
+        num_src = len(vid)
+        duration = (num_src - 1) / src_fps
+        num_target = max(1, int(duration * fps) + 1)
+        frames_idx = []
+        for i in range(num_target):
+            t = i / fps
+            src_idx = min(int(t * src_fps + 0.5), num_src - 1)
+            if not frames_idx or src_idx != frames_idx[-1]:
+                frames_idx.append(src_idx)
     print(
-        f"==> downsampled shape: {(len(frames_idx), resized_height, resized_width, 3)}, with stride: {stride}"
+        f"==> resampled shape: {(len(frames_idx), resized_height, resized_width, 3)}, "
+        f"src_fps={src_fps:.2f}, output_fps={fps:.2f}"
     )
     if process_length != -1 and process_length < len(frames_idx):
         frames_idx = frames_idx[:process_length]
@@ -548,17 +571,27 @@ class DepthCrafterDemo:
 
         del raw_depth
 
-        # Compute min/max from the finalized memmap so blended overlap
-        # regions are included and no stale pre-blend extrema leak through.
+        # Compute robust depth range using percentile clamp (1st/99th) so that
+        # a single bad outlier frame cannot compress disparity for the whole clip.
+        # We sample a fixed reservoir of pixel values across all frames to
+        # estimate percentiles without loading the full volume into memory.
         raw_depth = np.load(raw_depth_path, mmap_mode="r+")
-        depth_min = np.inf
-        depth_max = -np.inf
-        with tqdm(total=num_frames, desc="Depth extrema scan", unit="frame") as progress_bar:
+        reservoir_size = 500_000
+        rng = np.random.default_rng(seed=42)
+        reservoir = []
+        with tqdm(total=num_frames, desc="Depth percentile scan", unit="frame") as progress_bar:
             for start, stop in iter_batch_ranges(num_frames, 64):
                 batch = raw_depth[start:stop]
-                depth_min = min(depth_min, float(batch.min()))
-                depth_max = max(depth_max, float(batch.max()))
+                flat = batch.ravel()
+                # Subsample each batch proportionally to fill the reservoir.
+                n_sample = max(1, int(reservoir_size * len(flat) / max(num_frames * original_height * original_width, 1)))
+                n_sample = min(n_sample, len(flat))
+                reservoir.append(rng.choice(flat, size=n_sample, replace=False))
                 progress_bar.update(stop - start)
+        reservoir = np.concatenate(reservoir)
+        depth_min = float(np.percentile(reservoir, 1))
+        depth_max = float(np.percentile(reservoir, 99))
+        del reservoir
 
         depth_vis_writer = None
         if save_depth:
@@ -648,6 +681,7 @@ def DepthSplatting(
     depth_result,
     max_disp,
     batch_size,
+    save_debug_video=True,
 ):
     """
     Depth-Based Video Splatting Using the Video Depth.
@@ -669,23 +703,26 @@ def DepthSplatting(
     width = depth_result["width"]
     current_batch_size = max(1, int(batch_size))
 
-    # Initialize OpenCV VideoWriter
-    out = create_video_writer(
-        output_video_path,
-        video_plan["fps"],
-        width * 2,
-        height * 2,
-    )
-    sbs_output_video_path = os.path.join(
-        os.path.dirname(output_video_path) or ".",
-        f"{Path(video_plan['video_path']).stem}_sbs.mp4",
-    )
-    sbs_out = create_video_writer(
-        sbs_output_video_path,
-        video_plan["fps"],
-        width * 2,
-        height,
-    )
+    # Initialize OpenCV VideoWriters for debug grid + SBS preview (skippable).
+    out = None
+    sbs_out = None
+    if save_debug_video:
+        out = create_video_writer(
+            output_video_path,
+            video_plan["fps"],
+            width * 2,
+            height * 2,
+        )
+        sbs_output_video_path = os.path.join(
+            os.path.dirname(output_video_path) or ".",
+            f"{Path(video_plan['video_path']).stem}_sbs.mp4",
+        )
+        sbs_out = create_video_writer(
+            sbs_output_video_path,
+            video_plan["fps"],
+            width * 2,
+            height,
+        )
 
     # Lossless raw outputs for the inpainting stage (memory-mapped).
     # Keyed off the splatting output path so multiple runs from the same source
@@ -697,16 +734,17 @@ def DepthSplatting(
     raw_mask_path = os.path.join(output_dir, f"{output_stem}_raw_mask.npy")
     raw_meta_path = os.path.join(output_dir, f"{output_stem}_raw_meta.npz")
 
-    # Pre-allocate memory-mapped arrays: float32, channels-last for left/right,
-    # single-channel for the binary occlusion mask.
+    # Pre-allocate memory-mapped arrays.  Left frames originated as uint8/255
+    # so uint8 is lossless; mask is binary so uint8 suffices; right is the warp
+    # output where float16 preserves ample precision while halving I/O.
     mmap_left = np.lib.format.open_memmap(
-        raw_left_path, mode="w+", dtype=np.float32, shape=(num_frames, height, width, 3)
+        raw_left_path, mode="w+", dtype=np.uint8, shape=(num_frames, height, width, 3)
     )
     mmap_right = np.lib.format.open_memmap(
-        raw_right_path, mode="w+", dtype=np.float32, shape=(num_frames, height, width, 3)
+        raw_right_path, mode="w+", dtype=np.float16, shape=(num_frames, height, width, 3)
     )
     mmap_mask = np.lib.format.open_memmap(
-        raw_mask_path, mode="w+", dtype=np.float32, shape=(num_frames, height, width, 1)
+        raw_mask_path, mode="w+", dtype=np.uint8, shape=(num_frames, height, width, 1)
     )
 
     splatting_succeeded = False
@@ -733,7 +771,7 @@ def DepthSplatting(
                             dtype=np.float32,
                             copy=True,
                         )
-                        batch_depth_vis = vis_sequence_depth(batch_depth)
+                        batch_depth_vis = vis_sequence_depth(batch_depth) if save_debug_video else None
 
                         left_video = (
                             torch.from_numpy(batch_frames)
@@ -765,39 +803,43 @@ def DepthSplatting(
                             .permute(0, 2, 3, 1)
                             .numpy()
                         )
-                        occlusion_mask = occlusion_mask_1ch.repeat(3, axis=-1)
-
                         batch_len = len(batch_frames)
-                        # Write raw lossless data into memory-mapped arrays.
-                        mmap_left[frame_offset : frame_offset + batch_len] = batch_frames[:batch_len]
-                        mmap_right[frame_offset : frame_offset + batch_len] = right_video[:batch_len]
-                        mmap_mask[frame_offset : frame_offset + batch_len] = occlusion_mask_1ch[:batch_len]
+                        # Write raw data into memory-mapped arrays (dtype-converted).
+                        mmap_left[frame_offset : frame_offset + batch_len] = np.clip(
+                            batch_frames[:batch_len] * 255.0, 0, 255
+                        ).astype(np.uint8)
+                        mmap_right[frame_offset : frame_offset + batch_len] = right_video[:batch_len].astype(np.float16)
+                        mmap_mask[frame_offset : frame_offset + batch_len] = np.clip(
+                            occlusion_mask_1ch[:batch_len] * 255.0, 0, 255
+                        ).astype(np.uint8)
 
-                        for j in range(batch_len):
-                            video_grid_top = np.concatenate(
-                                [batch_frames[j], batch_depth_vis[j]], axis=1
-                            )
-                            video_grid_bottom = np.concatenate(
-                                [occlusion_mask[j], right_video[j]], axis=1
-                            )
-                            video_grid = np.concatenate(
-                                [video_grid_top, video_grid_bottom], axis=0
-                            )
+                        if save_debug_video:
+                            occlusion_mask = occlusion_mask_1ch.repeat(3, axis=-1)
+                            for j in range(batch_len):
+                                video_grid_top = np.concatenate(
+                                    [batch_frames[j], batch_depth_vis[j]], axis=1
+                                )
+                                video_grid_bottom = np.concatenate(
+                                    [occlusion_mask[j], right_video[j]], axis=1
+                                )
+                                video_grid = np.concatenate(
+                                    [video_grid_top, video_grid_bottom], axis=0
+                                )
 
-                            video_grid_uint8 = np.clip(video_grid * 255.0, 0, 255).astype(
-                                np.uint8
-                            )
-                            video_grid_bgr = cv2.cvtColor(video_grid_uint8, cv2.COLOR_RGB2BGR)
-                            out.write(video_grid_bgr)
+                                video_grid_uint8 = np.clip(video_grid * 255.0, 0, 255).astype(
+                                    np.uint8
+                                )
+                                video_grid_bgr = cv2.cvtColor(video_grid_uint8, cv2.COLOR_RGB2BGR)
+                                out.write(video_grid_bgr)
 
-                            sbs_video = np.concatenate(
-                                [batch_frames[j], right_video[j]], axis=1
-                            )
-                            sbs_uint8 = np.clip(sbs_video * 255.0, 0, 255).astype(
-                                np.uint8
-                            )
-                            sbs_bgr = cv2.cvtColor(sbs_uint8, cv2.COLOR_RGB2BGR)
-                            sbs_out.write(sbs_bgr)
+                                sbs_video = np.concatenate(
+                                    [batch_frames[j], right_video[j]], axis=1
+                                )
+                                sbs_uint8 = np.clip(sbs_video * 255.0, 0, 255).astype(
+                                    np.uint8
+                                )
+                                sbs_bgr = cv2.cvtColor(sbs_uint8, cv2.COLOR_RGB2BGR)
+                                sbs_out.write(sbs_bgr)
 
                         processed_frames = len(batch_indices)
                         frame_offset += processed_frames
@@ -821,8 +863,10 @@ def DepthSplatting(
                         del left_video, disp_map, right_video, occlusion_mask
         splatting_succeeded = True
     finally:
-        out.release()
-        sbs_out.release()
+        if out is not None:
+            out.release()
+        if sbs_out is not None:
+            sbs_out.release()
         if splatting_succeeded:
             # Flush memory-mapped arrays and write metadata for the inpainting stage.
             mmap_left.flush()
@@ -870,6 +914,7 @@ def main(
     seed: int = 42,
     track_time: bool = False,
     save_depth: bool = False,
+    save_debug_video: bool = True,
     compile_cache_dir: str = None,
     compile_warmup: bool = True,
 ):
@@ -932,6 +977,7 @@ def main(
                 depth_result,
                 max_disp,
                 batch_size,
+                save_debug_video=save_debug_video,
             )
     finally:
         save_compile_artifacts(compile_artifact_path)

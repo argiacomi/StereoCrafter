@@ -249,16 +249,26 @@ def load_inpainting_chunk(video_reader, start, stop, orig_height, orig_width, pa
 
 
 def load_inpainting_chunk_raw(mmap_left, mmap_right, mmap_mask, start, stop, pad_h, pad_w):
-    """Lossless loader: read raw float32 memmap arrays written by the splatting stage."""
-    left = torch.from_numpy(
-        np.array(mmap_left[start:stop], copy=True)
-    ).permute(0, 3, 1, 2).contiguous()
-    right = torch.from_numpy(
-        np.array(mmap_right[start:stop], copy=True)
-    ).permute(0, 3, 1, 2).contiguous()
-    mask = torch.from_numpy(
-        np.array(mmap_mask[start:stop], copy=True)
-    ).permute(0, 3, 1, 2).contiguous()
+    """Loader for compact memmap arrays written by the splatting stage.
+
+    Supports both legacy float32 sidecars and the newer compact layout
+    (uint8 left/mask, float16 right).  Everything is promoted to float32
+    tensors in [0, 1] for the inpainting pipeline.
+    """
+    raw_left = np.array(mmap_left[start:stop], copy=True)
+    if raw_left.dtype == np.uint8:
+        raw_left = raw_left.astype(np.float32) / 255.0
+    left = torch.from_numpy(raw_left).permute(0, 3, 1, 2).contiguous()
+
+    raw_right = np.array(mmap_right[start:stop], copy=True)
+    if raw_right.dtype != np.float32:
+        raw_right = raw_right.astype(np.float32)
+    right = torch.from_numpy(raw_right).permute(0, 3, 1, 2).contiguous()
+
+    raw_mask = np.array(mmap_mask[start:stop], copy=True)
+    if raw_mask.dtype == np.uint8:
+        raw_mask = raw_mask.astype(np.float32) / 255.0
+    mask = torch.from_numpy(raw_mask).permute(0, 3, 1, 2).contiguous()
 
     left = _pad_to_model_res(left, pad_h, pad_w)
     right = _pad_to_model_res(right, pad_h, pad_w)
