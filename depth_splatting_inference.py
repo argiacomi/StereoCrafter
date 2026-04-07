@@ -84,21 +84,60 @@ def try_enable_memory_feature(method_owner, method_name, feature_name, component
         return False
 
 
+def ceil_to_multiple(value, multiple):
+    value = int(value)
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def compute_video_geometry(original_height, original_width, max_res, align=64):
+    if max_res < align:
+        raise ValueError(
+            f"max_res must be at least {align} so frames can be aligned to {align}, "
+            f"got {max_res}."
+        )
+
+    max_aligned_res = (int(max_res) // align) * align
+    scale = min(1.0, max_aligned_res / max(original_height, original_width))
+    content_height = max(1, min(int(round(original_height * scale)), max_aligned_res))
+    content_width = max(1, min(int(round(original_width * scale)), max_aligned_res))
+    model_height = ceil_to_multiple(content_height, align)
+    model_width = ceil_to_multiple(content_width, align)
+    return content_height, content_width, model_height, model_width
+
+
+def pad_frames_to_model_resolution(frames, model_height, model_width):
+    pad_h = model_height - frames.shape[1]
+    pad_w = model_width - frames.shape[2]
+    if pad_h < 0 or pad_w < 0:
+        raise ValueError(
+            "Model resolution must be greater than or equal to the decoded frame size, "
+            f"got frames={frames.shape[1:3]} and model={(model_height, model_width)}."
+        )
+    if pad_h == 0 and pad_w == 0:
+        return frames
+    # Replicate-pad only the bottom/right edges so visible content keeps its
+    # aspect ratio and can be cropped back out without coordinate drift.
+    return np.pad(frames, ((0, 0), (0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+
+
+def crop_depth_to_content(depth_chunk, content_height, content_width):
+    if depth_chunk.shape[1] < content_height or depth_chunk.shape[2] < content_width:
+        raise ValueError(
+            "Depth output is smaller than the decoded content region, "
+            f"got depth={depth_chunk.shape[1:3]} and content={(content_height, content_width)}."
+        )
+    return depth_chunk[:, :content_height, :content_width]
+
+
 def build_video_plan(video_path, process_length, target_fps, max_res, dataset="open"):
     if dataset == "open":
         print("==> processing video: ", video_path)
         vid = VideoReader(video_path, ctx=cpu(0))
         original_height, original_width = vid[0].shape[:2]
         print("==> original video shape: ", (len(vid), original_height, original_width))
-        height = (original_height // 64) * 64
-        width = (original_width // 64) * 64
-        if max(height, width) > max_res:
-            scale = max_res / max(original_height, original_width)
-            height = (int(original_height * scale) // 64) * 64
-            width = (int(original_width * scale) // 64) * 64
-        # Ensure dimensions are at least 64.
-        height = max(height, 64)
-        width = max(width, 64)
+        height, width, model_height, model_width = compute_video_geometry(
+            original_height, original_width, max_res
+        )
     else:
         raise ValueError(
             f"Unknown dataset '{dataset}'. Only 'open' is supported. "
@@ -133,6 +172,12 @@ def build_video_plan(video_path, process_length, target_fps, max_res, dataset="o
         f"==> resampled shape: {(len(frames_idx), resized_height, resized_width, 3)}, "
         f"src_fps={src_fps:.2f}, output_fps={fps:.2f}"
     )
+    if (model_height, model_width) != (resized_height, resized_width):
+        print(
+            "==> model input uses edge padding to preserve aspect ratio: "
+            f"content={(resized_height, resized_width)}, "
+            f"model_input={(model_height, model_width)}"
+        )
     if process_length != -1 and process_length < len(frames_idx):
         frames_idx = frames_idx[:process_length]
     print(
@@ -147,6 +192,8 @@ def build_video_plan(video_path, process_length, target_fps, max_res, dataset="o
         "original_width": original_width,
         "resized_height": resized_height,
         "resized_width": resized_width,
+        "model_height": model_height,
+        "model_width": model_width,
     }
 
 
@@ -220,6 +267,12 @@ def write_video_opencv(input_frames, fps, output_video_path):
 
 
 def resize_depth_to_original(depth_chunk, original_height, original_width, device):
+    if (
+        depth_chunk.shape[1] == original_height
+        and depth_chunk.shape[2] == original_width
+    ):
+        return depth_chunk.astype(np.float32, copy=False)
+
     resized_chunks = []
     resize_batch_size = 64
     for start, stop in iter_batch_ranges(len(depth_chunk), resize_batch_size):
@@ -239,6 +292,80 @@ def resize_depth_to_original(depth_chunk, original_height, original_width, devic
 def normalize_depth_batch(depth_batch, depth_min, depth_max):
     denom = max(depth_max - depth_min, 1e-6)
     return np.clip((depth_batch - depth_min) / denom, 0.0, 1.0).astype(np.float32)
+
+
+def format_bytes(num_bytes):
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    size = float(num_bytes)
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+
+
+def estimate_pipeline_storage_bytes(
+    num_frames,
+    height,
+    width,
+    *,
+    save_raw_sidecars,
+    save_depth_copy,
+):
+    pixels_per_frame = num_frames * height * width
+
+    # DepthCrafter scratch memmap: float32 single-channel depth.
+    required_bytes = pixels_per_frame * 4
+
+    if save_raw_sidecars:
+        # left uint8 RGB (3 B/pixel) + right float16 RGB (6 B/pixel)
+        # + mask uint8 1-channel (1 B/pixel)
+        required_bytes += pixels_per_frame * 10
+
+    if save_depth_copy:
+        required_bytes += pixels_per_frame * 4
+
+    # Leave some slack for video container writes, filesystem metadata, and
+    # temporary allocation overhead so we fail early instead of SIGBUS later.
+    return int(required_bytes * 1.10) + 512 * 1024 * 1024
+
+
+def validate_storage_headroom(
+    target_dir,
+    *,
+    num_frames,
+    height,
+    width,
+    save_raw_sidecars,
+    save_depth_copy,
+):
+    usage = shutil.disk_usage(target_dir)
+    required_bytes = estimate_pipeline_storage_bytes(
+        num_frames,
+        height,
+        width,
+        save_raw_sidecars=save_raw_sidecars,
+        save_depth_copy=save_depth_copy,
+    )
+    if usage.free >= required_bytes:
+        return
+
+    guidance = [
+        "reduce `--max_res` or `--target_fps`",
+        "write outputs to a filesystem with more free space",
+    ]
+    if save_raw_sidecars:
+        guidance.append(
+            "rerun with `--save_raw_sidecars False` to use the legacy MP4 handoff"
+        )
+
+    raise RuntimeError(
+        "Insufficient free space for the depth+splatting pipeline. "
+        f"Estimated requirement: {format_bytes(required_bytes)}; "
+        f"available in {target_dir}: {format_bytes(usage.free)}. "
+        + "Options: "
+        + "; ".join(guidance)
+        + "."
+    )
 
 
 class DepthCrafterDemo:
@@ -448,6 +575,8 @@ class DepthCrafterDemo:
         original_width = video_plan["original_width"]
         resized_height = video_plan["resized_height"]
         resized_width = video_plan["resized_width"]
+        model_height = video_plan["model_height"]
+        model_width = video_plan["model_width"]
         target_fps = video_plan["fps"]
         save_path = os.path.join(
             os.path.dirname(output_video_path), os.path.splitext(os.path.basename(output_video_path))[0]
@@ -482,6 +611,9 @@ class DepthCrafterDemo:
             warmup_frames = (
                 resized_reader.get_batch(warmup_indices).asnumpy().astype(np.float32)
                 / 255.0
+            )
+            warmup_frames = pad_frames_to_model_resolution(
+                warmup_frames, model_height, model_width
             )
             print(
                 "Warming up torch.compile on the canonical depth chunk shape "
@@ -519,6 +651,9 @@ class DepthCrafterDemo:
                     resized_reader.get_batch(chunk_indices).asnumpy().astype(np.float32)
                     / 255.0
                 )
+                frames = pad_frames_to_model_resolution(
+                    frames, model_height, model_width
+                )
                 use_compiled_unet = self._compiled_unet and (
                     len(chunk_indices) == compiled_chunk_length
                 )
@@ -548,6 +683,9 @@ class DepthCrafterDemo:
                 )
 
             chunk_depth = chunk_depth.sum(-1) / chunk_depth.shape[-1]
+            chunk_depth = crop_depth_to_content(
+                chunk_depth, resized_height, resized_width
+            )
             chunk_depth = resize_depth_to_original(
                 chunk_depth, original_height, original_width, device
             )
@@ -681,6 +819,7 @@ def DepthSplatting(
     depth_result,
     max_disp,
     batch_size,
+    save_raw_sidecars=True,
     save_debug_video=True,
 ):
     """
@@ -733,19 +872,31 @@ def DepthSplatting(
     raw_right_path = os.path.join(output_dir, f"{output_stem}_raw_right.npy")
     raw_mask_path = os.path.join(output_dir, f"{output_stem}_raw_mask.npy")
     raw_meta_path = os.path.join(output_dir, f"{output_stem}_raw_meta.npz")
+    raw_sidecar_paths = (raw_left_path, raw_right_path, raw_mask_path, raw_meta_path)
 
-    # Pre-allocate memory-mapped arrays.  Left frames originated as uint8/255
-    # so uint8 is lossless; mask is binary so uint8 suffices; right is the warp
-    # output where float16 preserves ample precision while halving I/O.
-    mmap_left = np.lib.format.open_memmap(
-        raw_left_path, mode="w+", dtype=np.uint8, shape=(num_frames, height, width, 3)
-    )
-    mmap_right = np.lib.format.open_memmap(
-        raw_right_path, mode="w+", dtype=np.float16, shape=(num_frames, height, width, 3)
-    )
-    mmap_mask = np.lib.format.open_memmap(
-        raw_mask_path, mode="w+", dtype=np.uint8, shape=(num_frames, height, width, 1)
-    )
+    if not save_raw_sidecars:
+        for p in raw_sidecar_paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    mmap_left = None
+    mmap_right = None
+    mmap_mask = None
+    if save_raw_sidecars:
+        # Pre-allocate memory-mapped arrays. Left frames originated as uint8/255
+        # so uint8 is lossless; mask is binary so uint8 suffices; right is the
+        # warp output where float16 preserves ample precision while halving I/O.
+        mmap_left = np.lib.format.open_memmap(
+            raw_left_path, mode="w+", dtype=np.uint8, shape=(num_frames, height, width, 3)
+        )
+        mmap_right = np.lib.format.open_memmap(
+            raw_right_path, mode="w+", dtype=np.float16, shape=(num_frames, height, width, 3)
+        )
+        mmap_mask = np.lib.format.open_memmap(
+            raw_mask_path, mode="w+", dtype=np.uint8, shape=(num_frames, height, width, 1)
+        )
 
     splatting_succeeded = False
     try:
@@ -804,14 +955,16 @@ def DepthSplatting(
                             .numpy()
                         )
                         batch_len = len(batch_frames)
-                        # Write raw data into memory-mapped arrays (dtype-converted).
-                        mmap_left[frame_offset : frame_offset + batch_len] = np.clip(
-                            batch_frames[:batch_len] * 255.0, 0, 255
-                        ).astype(np.uint8)
-                        mmap_right[frame_offset : frame_offset + batch_len] = right_video[:batch_len].astype(np.float16)
-                        mmap_mask[frame_offset : frame_offset + batch_len] = np.clip(
-                            occlusion_mask_1ch[:batch_len] * 255.0, 0, 255
-                        ).astype(np.uint8)
+                        if save_raw_sidecars:
+                            # Write raw data into memory-mapped arrays
+                            # (dtype-converted).
+                            mmap_left[frame_offset : frame_offset + batch_len] = np.clip(
+                                batch_frames[:batch_len] * 255.0, 0, 255
+                            ).astype(np.uint8)
+                            mmap_right[frame_offset : frame_offset + batch_len] = right_video[:batch_len].astype(np.float16)
+                            mmap_mask[frame_offset : frame_offset + batch_len] = np.clip(
+                                occlusion_mask_1ch[:batch_len] * 255.0, 0, 255
+                            ).astype(np.uint8)
 
                         if save_debug_video:
                             occlusion_mask = occlusion_mask_1ch.repeat(3, axis=-1)
@@ -868,26 +1021,28 @@ def DepthSplatting(
         if sbs_out is not None:
             sbs_out.release()
         if splatting_succeeded:
-            # Flush memory-mapped arrays and write metadata for the inpainting stage.
-            mmap_left.flush()
-            mmap_right.flush()
-            mmap_mask.flush()
-            np.savez(
-                raw_meta_path,
-                num_frames=num_frames,
-                height=height,
-                width=width,
-                fps=video_plan["fps"],
-                left_path=raw_left_path,
-                right_path=raw_right_path,
-                mask_path=raw_mask_path,
-            )
+            if save_raw_sidecars:
+                # Flush memory-mapped arrays and write metadata for the
+                # inpainting stage.
+                mmap_left.flush()
+                mmap_right.flush()
+                mmap_mask.flush()
+                np.savez(
+                    raw_meta_path,
+                    num_frames=num_frames,
+                    height=height,
+                    width=width,
+                    fps=video_plan["fps"],
+                    left_path=raw_left_path,
+                    right_path=raw_right_path,
+                    mask_path=raw_mask_path,
+                )
         else:
             # Clean up partial raw files so inpainting doesn't consume incomplete data.
             # Delete the mmap references first so the underlying files are not held
             # open (required on Windows where unlinking active memmaps fails).
             del mmap_left, mmap_right, mmap_mask
-            for p in (raw_left_path, raw_right_path, raw_mask_path, raw_meta_path):
+            for p in raw_sidecar_paths:
                 try:
                     os.remove(p)
                 except OSError:
@@ -914,6 +1069,7 @@ def main(
     seed: int = 42,
     track_time: bool = False,
     save_depth: bool = False,
+    save_raw_sidecars: bool = True,
     save_debug_video: bool = True,
     compile_cache_dir: str = None,
     compile_warmup: bool = True,
@@ -936,6 +1092,22 @@ def main(
         max_res,
         dataset,
     )
+    if not save_raw_sidecars and not save_debug_video:
+        raise ValueError(
+            "At least one stage-1 handoff must be enabled: set either "
+            "`--save_raw_sidecars True` or `--save_debug_video True`."
+        )
+
+    scratch_root = os.path.dirname(output_video_path) or "."
+    os.makedirs(scratch_root, exist_ok=True)
+    validate_storage_headroom(
+        scratch_root,
+        num_frames=len(video_plan["frame_indices"]),
+        height=video_plan["original_height"],
+        width=video_plan["original_width"],
+        save_raw_sidecars=save_raw_sidecars,
+        save_depth_copy=save_depth,
+    )
 
     depthcrafter_demo = DepthCrafterDemo(
         unet_path=unet_path,
@@ -943,8 +1115,6 @@ def main(
         cpu_offload=cpu_offload,
     )
 
-    scratch_root = os.path.dirname(output_video_path) or "."
-    os.makedirs(scratch_root, exist_ok=True)
     try:
         with tempfile.TemporaryDirectory(
             prefix="stereocrafter_depth_", dir=scratch_root
@@ -977,6 +1147,7 @@ def main(
                 depth_result,
                 max_disp,
                 batch_size,
+                save_raw_sidecars=save_raw_sidecars,
                 save_debug_video=save_debug_video,
             )
     finally:
