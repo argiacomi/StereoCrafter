@@ -376,6 +376,7 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         return_dict: bool = True,
         clip_image: Optional[torch.FloatTensor] = None,
+        image_embeddings: Optional[torch.FloatTensor] = None,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -483,15 +484,16 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         do_classifier_free_guidance = max(min_guidance_scale, max_guidance_scale) > 1.0
 
         # 3. Encode input image for CLIP conditioning.
-        # When clip_image is provided, use it instead of frames[0:1] so that
-        # overlap-replaced frames don't drift the global conditioning signal.
-        clip_source = clip_image if clip_image is not None else frames[0:1]
-        image_embeddings = self._encode_image(
-            clip_source,
-            device,
-            num_videos_per_prompt,
-            do_classifier_free_guidance,
-        )
+        # Pre-computed image_embeddings can be passed to avoid redundant encoding
+        # (e.g. when tiling calls the pipeline once per tile with the same image).
+        if image_embeddings is None:
+            clip_source = clip_image if clip_image is not None else frames[0:1]
+            image_embeddings = self._encode_image(
+                clip_source,
+                device,
+                num_videos_per_prompt,
+                do_classifier_free_guidance,
+            )
 
         # NOTE: Stable Diffusion Video was conditioned on fps - 1, which
         # is why it is reduced here.

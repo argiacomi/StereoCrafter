@@ -122,10 +122,35 @@ def spatial_tiled_process(
             f"with tile overlap {tile_overlap}."
         )
 
-    cols = []
-    for i in range(0, tile_num):
-        rows = []
-        for j in range(0, tile_num):
+    latent_stride = (
+        tile_stride[0] // spatial_n_compress,
+        tile_stride[1] // spatial_n_compress,
+    )
+    latent_overlap = (
+        tile_overlap[0] // spatial_n_compress,
+        tile_overlap[1] // spatial_n_compress,
+    )
+
+    # Pre-encode the chunk-global CLIP image once so we don't repeat it per tile.
+    if tile_num > 1 and "image_embeddings" not in kargs:
+        clip_image = kargs.pop("clip_image", None)
+        clip_source = clip_image if clip_image is not None else cond_frames[0:1]
+        kargs["image_embeddings"] = process_func._encode_image(
+            clip_source,
+            process_func._execution_device,
+            1,  # num_videos_per_prompt
+            max(kargs.get("min_guidance_scale", 1.0), kargs.get("max_guidance_scale", 1.0)) > 1.0,
+        )
+
+    # Generate, blend, and trim tiles row-by-row so that at most two rows of
+    # latents are resident at once (current + previous for vertical blending).
+    # Blending always uses already-blended neighbors so 4-way overlap corners
+    # are weight-normalized consistently.
+    prev_row = None  # blended tiles from the previous row (needed for blend_v)
+    row_strips = []
+    for i in range(tile_num):
+        cur_row = []
+        for j in range(tile_num):
             cond_tile = cond_frames[
                 :,
                 :,
@@ -149,40 +174,30 @@ def spatial_tiled_process(
                 **kargs,
             ).frames[0]
 
-            rows.append(tile)
-        cols.append(rows)
-
-    latent_stride = (
-        tile_stride[0] // spatial_n_compress,
-        tile_stride[1] // spatial_n_compress,
-    )
-    latent_overlap = (
-        tile_overlap[0] // spatial_n_compress,
-        tile_overlap[1] // spatial_n_compress,
-    )
-
-    results_cols = []
-    for i, rows in enumerate(cols):
-        results_rows = []
-        for j, tile in enumerate(rows):
-            if i > 0:
-                tile = blend_v(cols[i - 1][j], tile, latent_overlap[0])
+            # Blend against already-blended neighbors (progressive, not raw).
+            if prev_row is not None:
+                tile = blend_v(prev_row[j], tile, latent_overlap[0])
             if j > 0:
-                tile = blend_h(rows[j - 1], tile, latent_overlap[1])
-            results_rows.append(tile)
-        results_cols.append(results_rows)
+                tile = blend_h(cur_row[j - 1], tile, latent_overlap[1])
 
-    pixels = []
-    for i, rows in enumerate(results_cols):
-        for j, tile in enumerate(rows):
-            if i < len(results_cols) - 1:
-                tile = tile[:, :, : latent_stride[0], :]
-            if j < len(rows) - 1:
+            cur_row.append(tile)
+
+        # Trim each tile's contribution to its stride region (except last tile
+        # in each dimension which keeps its full extent) and concatenate the row.
+        trimmed = []
+        for j, tile in enumerate(cur_row):
+            if j < tile_num - 1:
                 tile = tile[:, :, :, : latent_stride[1]]
-            rows[j] = tile
-        pixels.append(torch.cat(rows, dim=3))
-    x = torch.cat(pixels, dim=2)
-    return x
+            trimmed.append(tile)
+        row_strip = torch.cat(trimmed, dim=3)
+
+        if i < tile_num - 1:
+            row_strip = row_strip[:, :, : latent_stride[0], :]
+
+        row_strips.append(row_strip)
+        prev_row = cur_row  # keep for next row's vertical blending
+
+    return torch.cat(row_strips, dim=2)
 
 
 def create_video_writer(output_video_path, fps, width, height):
@@ -536,6 +551,9 @@ def main(
                 try:
                     if use_compiled_unet:
                         mark_torch_compile_step_begin()
+                    # fps and motion_bucket_id are SVD micro-conditioning values
+                    # baked into the checkpoint, not the actual output framerate.
+                    # The pipeline shifts fps to fps-1 internally.
                     video_latents = spatial_tiled_process(
                         input_frames_i,
                         frames_mask,

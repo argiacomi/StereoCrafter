@@ -614,8 +614,10 @@ class ForwardWarpStereo(nn.Module):
         """
         im = im.contiguous()
         disp = disp.contiguous()
-        # weights_map = torch.abs(disp)
-        weights_map = disp - disp.min()
+        # Per-frame min so the weighting is independent of batch composition
+        # (batch size can change under OOM fallback).
+        disp_min = disp.flatten(1).min(dim=1).values[:, None, None, None]
+        weights_map = disp - disp_min
         weights_map = (
             1.414
         ) ** weights_map  # using 1.414 instead of EXP for avoding numerical overflow.
