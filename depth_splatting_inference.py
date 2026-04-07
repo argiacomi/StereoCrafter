@@ -25,6 +25,7 @@ if FORWARD_WARP_ROOT.is_dir() and str(FORWARD_WARP_ROOT) not in sys.path:
 
 from Forward_Warp import forward_warp
 from tqdm import tqdm
+
 from torch_runtime_utils import (
     configure_compile_cache,
     configure_cuda_performance_flags,
@@ -822,7 +823,7 @@ def DepthSplatting(
     max_disp,
     batch_size,
     save_raw_sidecars=True,
-    save_debug_video=False,
+    save_debug_video=True,
 ):
     """
     Depth-Based Video Splatting Using the Video Depth.
@@ -1087,7 +1088,7 @@ def main(
     track_time: bool = False,
     save_depth: bool = False,
     save_raw_sidecars: bool = True,
-    save_debug_video: bool = False,
+    save_debug_video: bool = True,
     compile_cache_dir: str = None,
     compile_warmup: bool = True,
 ):
