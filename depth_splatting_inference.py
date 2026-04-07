@@ -167,30 +167,33 @@ def shrink_temporal_window(window_size, overlap):
     return next_window_size, next_overlap
 
 
+def create_video_writer(output_video_path, fps, width, height):
+    """Create a VideoWriter preferring HEVC, falling back to mp4v."""
+    for codec in ("HEVC", "mp4v"):
+        writer = cv2.VideoWriter(
+            output_video_path,
+            cv2.VideoWriter_fourcc(*codec),
+            fps,
+            (width, height),
+        )
+        if writer.isOpened():
+            return writer
+        writer.release()
+    raise RuntimeError(
+        f"Failed to open VideoWriter for {output_video_path} with any codec."
+    )
+
+
 def write_video_opencv(input_frames, fps, output_video_path):
     num_frames = len(input_frames)
     height, width, _ = input_frames[0].shape
 
-    out = cv2.VideoWriter(
-        output_video_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (width, height),
-    )
+    out = create_video_writer(output_video_path, fps, width, height)
 
     for i in range(num_frames):
         out.write(input_frames[i, :, :, ::-1])
 
     out.release()
-
-
-def create_video_writer(output_video_path, fps, width, height):
-    return cv2.VideoWriter(
-        output_video_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (width, height),
-    )
 
 
 def resize_depth_to_original(depth_chunk, original_height, original_width, device):
@@ -667,11 +670,11 @@ def DepthSplatting(
     current_batch_size = max(1, int(batch_size))
 
     # Initialize OpenCV VideoWriter
-    out = cv2.VideoWriter(
+    out = create_video_writer(
         output_video_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
         video_plan["fps"],
-        (width * 2, height * 2),
+        width * 2,
+        height * 2,
     )
     sbs_output_video_path = os.path.join(
         os.path.dirname(output_video_path) or ".",

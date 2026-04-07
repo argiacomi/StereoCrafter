@@ -201,11 +201,19 @@ def spatial_tiled_process(
 
 
 def create_video_writer(output_video_path, fps, width, height):
-    return cv2.VideoWriter(
-        output_video_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (width, height),
+    """Create a VideoWriter preferring HEVC, falling back to mp4v."""
+    for codec in ("HEVC", "mp4v"):
+        writer = cv2.VideoWriter(
+            output_video_path,
+            cv2.VideoWriter_fourcc(*codec),
+            fps,
+            (width, height),
+        )
+        if writer.isOpened():
+            return writer
+        writer.release()
+    raise RuntimeError(
+        f"Failed to open VideoWriter for {output_video_path} with any codec."
     )
 
 
