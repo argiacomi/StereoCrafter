@@ -682,6 +682,29 @@ def DepthSplatting(
         height,
     )
 
+    # Lossless raw outputs for the inpainting stage (memory-mapped).
+    # Keyed off the splatting output path so multiple runs from the same source
+    # video don't collide — each splatting MP4 gets its own set of sidecars.
+    output_dir = os.path.dirname(output_video_path) or "."
+    output_stem = Path(output_video_path).stem  # e.g. "camel_splatting_results"
+    raw_left_path = os.path.join(output_dir, f"{output_stem}_raw_left.npy")
+    raw_right_path = os.path.join(output_dir, f"{output_stem}_raw_right.npy")
+    raw_mask_path = os.path.join(output_dir, f"{output_stem}_raw_mask.npy")
+    raw_meta_path = os.path.join(output_dir, f"{output_stem}_raw_meta.npz")
+
+    # Pre-allocate memory-mapped arrays: float32, channels-last for left/right,
+    # single-channel for the binary occlusion mask.
+    mmap_left = np.lib.format.open_memmap(
+        raw_left_path, mode="w+", dtype=np.float32, shape=(num_frames, height, width, 3)
+    )
+    mmap_right = np.lib.format.open_memmap(
+        raw_right_path, mode="w+", dtype=np.float32, shape=(num_frames, height, width, 3)
+    )
+    mmap_mask = np.lib.format.open_memmap(
+        raw_mask_path, mode="w+", dtype=np.float32, shape=(num_frames, height, width, 1)
+    )
+
+    splatting_succeeded = False
     try:
         with torch.inference_mode():
             frame_offset = 0
@@ -730,14 +753,22 @@ def DepthSplatting(
                         )
 
                         right_video = right_video.cpu().permute(0, 2, 3, 1).numpy()
-                        occlusion_mask = (
+                        # Keep single-channel mask for lossless handoff;
+                        # expand to 3-ch only for the debug grid visualization.
+                        occlusion_mask_1ch = (
                             occlusion_mask.cpu()
                             .permute(0, 2, 3, 1)
                             .numpy()
-                            .repeat(3, axis=-1)
                         )
+                        occlusion_mask = occlusion_mask_1ch.repeat(3, axis=-1)
 
-                        for j in range(len(batch_frames)):
+                        batch_len = len(batch_frames)
+                        # Write raw lossless data into memory-mapped arrays.
+                        mmap_left[frame_offset : frame_offset + batch_len] = batch_frames[:batch_len]
+                        mmap_right[frame_offset : frame_offset + batch_len] = right_video[:batch_len]
+                        mmap_mask[frame_offset : frame_offset + batch_len] = occlusion_mask_1ch[:batch_len]
+
+                        for j in range(batch_len):
                             video_grid_top = np.concatenate(
                                 [batch_frames[j], batch_depth_vis[j]], axis=1
                             )
@@ -783,9 +814,35 @@ def DepthSplatting(
                         raise
                     finally:
                         del left_video, disp_map, right_video, occlusion_mask
+        splatting_succeeded = True
     finally:
         out.release()
         sbs_out.release()
+        if splatting_succeeded:
+            # Flush memory-mapped arrays and write metadata for the inpainting stage.
+            mmap_left.flush()
+            mmap_right.flush()
+            mmap_mask.flush()
+            np.savez(
+                raw_meta_path,
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                fps=video_plan["fps"],
+                left_path=raw_left_path,
+                right_path=raw_right_path,
+                mask_path=raw_mask_path,
+            )
+        else:
+            # Clean up partial raw files so inpainting doesn't consume incomplete data.
+            # Delete the mmap references first so the underlying files are not held
+            # open (required on Windows where unlinking active memmaps fails).
+            del mmap_left, mmap_right, mmap_mask
+            for p in (raw_left_path, raw_right_path, raw_mask_path, raw_meta_path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
 
 def main(

@@ -1,9 +1,12 @@
+import os
 import torch
 from torch.nn import Module, Parameter
 from torch.autograd import Function
 
 import forward_warp_cuda
 from .python import Forward_Warp_Python
+
+_DEBUG = os.environ.get("STEREOCRAFTER_DEBUG", "").lower() in ("1", "true", "yes")
 
 
 class forward_warp_function(Function):
@@ -22,8 +25,11 @@ class forward_warp_function(Function):
         assert(flow.shape[3] == 2)
         assert(im0.is_contiguous())
         assert(flow.is_contiguous())
-        assert(torch.isnan(flow).long().sum() == 0)
-        assert(torch.isinf(flow).long().sum() == 0)
+        # Full-tensor NaN/Inf checks force a device sync on every call.
+        # Gate behind STEREOCRAFTER_DEBUG to avoid inference overhead.
+        if _DEBUG:
+            assert(torch.isnan(flow).long().sum() == 0)
+            assert(torch.isinf(flow).long().sum() == 0)
 
         ctx.save_for_backward(im0, flow)
         ctx.interpolation_mode = interpolation_mode

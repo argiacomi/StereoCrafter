@@ -10,7 +10,6 @@ from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionM
 from fire import Fire
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
-    tensor2vid,
 )
 from torch_runtime_utils import (
     configure_compile_cache,
@@ -50,15 +49,36 @@ def spatial_tile_shape(height, width, tile_num, tile_overlap=(128, 128)):
         int((height + tile_overlap[0] * (tile_num - 1)) / tile_num),
         int((width + tile_overlap[1] * (tile_num - 1)) / tile_num),
     )
+    # Round tile sizes up to the nearest multiple of 8 so they satisfy the
+    # VAE's spatial compression requirement (height % 8 == 0, width % 8 == 0).
+    tile_size = (
+        ((tile_size[0] + 7) // 8) * 8,
+        ((tile_size[1] + 7) // 8) * 8,
+    )
     tile_stride = (tile_size[0] - tile_overlap[0], tile_size[1] - tile_overlap[1])
     return tile_size, tile_stride
 
 
 def max_supported_tile_num(height, width, tile_overlap=(128, 128)):
+    # Each tile contributes tile_stride pixels of unique content. When the
+    # stride shrinks below the minimum, additional tiles are degenerate —
+    # mostly overlap with negligible new information and wasted pipeline calls.
+    min_stride = (
+        max(1, tile_overlap[0] // 2),
+        max(1, tile_overlap[1] // 2),
+    )
     tile_num = 1
     while True:
-        _, tile_stride = spatial_tile_shape(height, width, tile_num, tile_overlap)
-        if tile_stride[0] <= 0 or tile_stride[1] <= 0:
+        tile_size, tile_stride = spatial_tile_shape(height, width, tile_num, tile_overlap)
+        if tile_stride[0] < min_stride[0] or tile_stride[1] < min_stride[1]:
+            return max(1, tile_num - 1)
+        # After rounding up, tiles must still fit within the frame.
+        if tile_size[0] > height or tile_size[1] > width:
+            return max(1, tile_num - 1)
+        # The last tile's start must fall within the frame.
+        last_start_h = (tile_num - 1) * tile_stride[0]
+        last_start_w = (tile_num - 1) * tile_stride[1]
+        if last_start_h >= height or last_start_w >= width:
             return max(1, tile_num - 1)
         tile_num += 1
 
@@ -179,17 +199,55 @@ def write_video_chunk(writer, input_frames):
         writer.write(frame[:, :, ::-1])
 
 
-def load_inpainting_chunk(video_reader, start, stop, crop_height, crop_width):
+def _pad_to_model_res(tensor, pad_h, pad_w):
+    """Replicate-pad the bottom/right edges to reach the model's 128-aligned resolution."""
+    if pad_h > 0 or pad_w > 0:
+        # F.pad order: (left, right, top, bottom)
+        tensor = torch.nn.functional.pad(tensor, (0, pad_w, 0, pad_h), mode="replicate")
+    return tensor
+
+
+def load_inpainting_chunk(video_reader, start, stop, orig_height, orig_width, pad_h, pad_w):
+    """Legacy loader: parse the 2x2 debug-grid MP4 into left/mask/warped, then pad."""
     frames = video_reader.get_batch(list(range(start, stop))).asnumpy()
     frames = torch.from_numpy(frames).permute(0, 3, 1, 2).contiguous().float()
-    frames = frames[:, :, : crop_height * 2, : crop_width * 2]
+    frames = frames[:, :, : orig_height * 2, : orig_width * 2]
     frames = frames / 255.0
 
-    frames_left = frames[:, :, :crop_height, :crop_width]
-    frames_mask = frames[:, :, crop_height : crop_height * 2, :crop_width]
-    frames_warpped = frames[:, :, crop_height : crop_height * 2, crop_width : crop_width * 2]
+    frames_left = frames[:, :, :orig_height, :orig_width]
+    frames_mask = frames[:, :, orig_height : orig_height * 2, :orig_width]
+    frames_warpped = frames[:, :, orig_height : orig_height * 2, orig_width : orig_width * 2]
     frames_mask = frames_mask.mean(dim=1, keepdim=True)
+
+    frames_left = _pad_to_model_res(frames_left, pad_h, pad_w)
+    frames_warpped = _pad_to_model_res(frames_warpped, pad_h, pad_w)
+    frames_mask = _pad_to_model_res(frames_mask, pad_h, pad_w)
     return frames_warpped, frames_left, frames_mask
+
+
+def load_inpainting_chunk_raw(mmap_left, mmap_right, mmap_mask, start, stop, pad_h, pad_w):
+    """Lossless loader: read raw float32 memmap arrays written by the splatting stage."""
+    left = torch.from_numpy(
+        np.array(mmap_left[start:stop], copy=True)
+    ).permute(0, 3, 1, 2).contiguous()
+    right = torch.from_numpy(
+        np.array(mmap_right[start:stop], copy=True)
+    ).permute(0, 3, 1, 2).contiguous()
+    mask = torch.from_numpy(
+        np.array(mmap_mask[start:stop], copy=True)
+    ).permute(0, 3, 1, 2).contiguous()
+
+    left = _pad_to_model_res(left, pad_h, pad_w)
+    right = _pad_to_model_res(right, pad_h, pad_w)
+    mask = _pad_to_model_res(mask, pad_h, pad_w)
+    return right, left, mask
+
+
+def decode_to_frames(video_tensor):
+    """Convert decode_latents output [B, C, F, H, W] to [F, C, H, W] in [0, 1]."""
+    frames = video_tensor[0]  # [C, F, H, W]
+    frames = (frames / 2 + 0.5).clamp(0, 1)  # denormalize from [-1, 1] to [0, 1]
+    return frames.permute(1, 0, 2, 3).contiguous().float()  # [F, C, H, W]
 
 
 def write_output_chunk(sbs_writer, anaglyph_writer, frames_left, frames_right):
@@ -327,23 +385,73 @@ def main(
         try_enable_memory_feature(pipeline.vae, "enable_tiling", "tiling", vae_name)
 
     os.makedirs(save_dir, exist_ok=True)
-    video_name = (
-        input_video_path.split("/")[-1]
-        .replace(".mp4", "")
-        .replace("_splatting_results", "")
-        + "_inpainting_results"
-    )
 
-    video_reader = VideoReader(input_video_path, ctx=cpu(0))
-    fps = video_reader.get_avg_fps()
-    num_frames = len(video_reader)
-    sample_frame = video_reader[0].asnumpy()
-    height = (sample_frame.shape[0] // 2) // 128 * 128
-    width = (sample_frame.shape[1] // 2) // 128 * 128
-    if height == 0 or width == 0:
-        raise ValueError(
-            f"Input video is too small after 128-alignment: derived output size is {(height, width)}."
+    # Detect lossless raw splatting outputs by checking for the meta file
+    # produced by the splatting stage alongside the grid MP4.
+    # Sidecars are keyed off the splatting output stem (e.g. foo_splatting_results_raw_meta.npz).
+    input_stem = Path(input_video_path).stem
+    raw_meta_path = os.path.join(
+        os.path.dirname(input_video_path) or ".", f"{input_stem}_raw_meta.npz"
+    )
+    use_raw = False
+    if os.path.isfile(raw_meta_path):
+        try:
+            raw_meta = np.load(raw_meta_path, allow_pickle=True)
+            mmap_left = np.load(str(raw_meta["left_path"]), mmap_mode="r")
+            mmap_right = np.load(str(raw_meta["right_path"]), mmap_mode="r")
+            mmap_mask = np.load(str(raw_meta["mask_path"]), mmap_mode="r")
+            fps = float(raw_meta["fps"])
+            num_frames = int(raw_meta["num_frames"])
+            raw_height = int(raw_meta["height"])
+            raw_width = int(raw_meta["width"])
+            video_reader = None
+            video_name = (
+                input_stem
+                .replace("_splatting_results", "")
+                + "_inpainting_results"
+            )
+            use_raw = True
+        except Exception as e:
+            print(
+                f"Warning: raw sidecar files found but unusable ({e}); "
+                "falling back to MP4 grid loader."
+            )
+            mmap_left = mmap_right = mmap_mask = None
+
+    if not use_raw:
+        mmap_left = mmap_right = mmap_mask = None
+        raw_height = raw_width = None
+        video_reader = VideoReader(input_video_path, ctx=cpu(0))
+        fps = video_reader.get_avg_fps()
+        num_frames = len(video_reader)
+        video_name = (
+            input_video_path.split("/")[-1]
+            .replace(".mp4", "")
+            .replace("_splatting_results", "")
+            + "_inpainting_results"
         )
+
+    # Pad to next 128-multiple instead of cropping, so we don't lose border pixels.
+    # The model output is cropped back to orig_height x orig_width before writing.
+    def _ceil128(x):
+        return ((x + 127) // 128) * 128
+
+    if use_raw:
+        orig_height, orig_width = raw_height, raw_width
+    else:
+        sample_frame = video_reader[0].asnumpy()
+        orig_height = sample_frame.shape[0] // 2
+        orig_width = sample_frame.shape[1] // 2
+
+    height = _ceil128(orig_height)
+    width = _ceil128(orig_width)
+    if orig_height == 0 or orig_width == 0:
+        raise ValueError(
+            f"Input video is too small: derived output size is {(orig_height, orig_width)}."
+        )
+    pad_h = height - orig_height
+    pad_w = width - orig_width
+
     max_tile_num = max_supported_tile_num(height, width)
     if tile_num > max_tile_num:
         raise ValueError(
@@ -353,8 +461,8 @@ def main(
 
     frames_sbs_path = os.path.join(save_dir, f"{video_name}_sbs.mp4")
     vid_anaglyph_path = os.path.join(save_dir, f"{video_name}_anaglyph.mp4")
-    sbs_writer = create_video_writer(frames_sbs_path, fps, width * 2, height)
-    anaglyph_writer = create_video_writer(vid_anaglyph_path, fps, width, height)
+    sbs_writer = create_video_writer(frames_sbs_path, fps, orig_width * 2, orig_height)
+    anaglyph_writer = create_video_writer(vid_anaglyph_path, fps, orig_width, orig_height)
 
     generated_context = None
     step = frames_chunk - overlap
@@ -396,6 +504,7 @@ def main(
         frames_mask,
         use_compiled_unet_for_chunk,
         use_compiled_vae_decoder_for_chunk,
+        clip_image=None,
     ):
         nonlocal compiled_unet_available
         nonlocal compiled_vae_decoder_available
@@ -440,6 +549,7 @@ def main(
                         noise_aug_strength=noise_aug_strength,
                         num_inference_steps=num_inference_steps,
                         vae_encode_chunk_size=current_vae_encode_chunk_size,
+                        clip_image=clip_image,
                     )
                     break
                 except Exception as exc:
@@ -641,29 +751,37 @@ def main(
                     "Warming up torch.compile on the canonical inpainting chunk shape "
                     f"({warmup_info['frame_count']} frames)."
                 )
-                warmup_frames_warpped, warmup_frames_left, warmup_frames_mask = (
-                    load_inpainting_chunk(
-                        video_reader,
-                        warmup_info["cur_i"],
-                        warmup_info["stop_i"],
-                        height,
-                        width,
+                if use_raw:
+                    warmup_frames_warpped, warmup_frames_left, warmup_frames_mask = (
+                        load_inpainting_chunk_raw(
+                            mmap_left, mmap_right, mmap_mask,
+                            warmup_info["cur_i"], warmup_info["stop_i"],
+                            pad_h, pad_w,
+                        )
                     )
-                )
+                else:
+                    warmup_frames_warpped, warmup_frames_left, warmup_frames_mask = (
+                        load_inpainting_chunk(
+                            video_reader,
+                            warmup_info["cur_i"],
+                            warmup_info["stop_i"],
+                            orig_height,
+                            orig_width,
+                            pad_h,
+                            pad_w,
+                        )
+                    )
                 warmup_video_frames = run_inpainting_chunk(
                     warmup_frames_warpped,
                     warmup_frames_mask,
                     use_compiled_unet_for_chunk=compiled_unet_available,
                     use_compiled_vae_decoder_for_chunk=compiled_vae_decoder_available,
+                    clip_image=warmup_frames_warpped[0:1],
                 )
                 warmed_chunk = (
                     warmup_info["start_i"],
                     warmup_frames_left,
-                    tensor2vid(
-                        warmup_video_frames,
-                        pipeline.image_processor,
-                        output_type="np",
-                    )[0],
+                    decode_to_frames(warmup_video_frames),
                 )
 
             for chunk_info in tqdm(
@@ -677,13 +795,22 @@ def main(
                     video_frames = warmed_chunk[2]
                     warmed_chunk = None
                 else:
-                    frames_warpped, frames_left, frames_mask = load_inpainting_chunk(
-                        video_reader,
-                        chunk_info["cur_i"],
-                        chunk_info["stop_i"],
-                        height,
-                        width,
-                    )
+                    if use_raw:
+                        frames_warpped, frames_left, frames_mask = load_inpainting_chunk_raw(
+                            mmap_left, mmap_right, mmap_mask,
+                            chunk_info["cur_i"], chunk_info["stop_i"],
+                            pad_h, pad_w,
+                        )
+                    else:
+                        frames_warpped, frames_left, frames_mask = load_inpainting_chunk(
+                            video_reader,
+                            chunk_info["cur_i"],
+                            chunk_info["stop_i"],
+                            orig_height,
+                            orig_width,
+                            pad_h,
+                            pad_w,
+                        )
 
                     input_frames_i = (
                         frames_warpped.clone()
@@ -718,21 +845,16 @@ def main(
                         )
                         tail_chunk_warned = True
 
+                    # Use the original warped frame (before overlap replacement)
+                    # for CLIP conditioning to prevent drift over long clips.
                     video_frames = run_inpainting_chunk(
                         input_frames_i,
                         frames_mask,
                         use_compiled_unet_for_chunk=use_compiled_chunk,
                         use_compiled_vae_decoder_for_chunk=use_compiled_chunk,
+                        clip_image=frames_warpped[0:1],
                     )
-                    video_frames = tensor2vid(
-                        video_frames, pipeline.image_processor, output_type="np"
-                    )[0]
-                video_frames = (
-                    torch.from_numpy(video_frames)
-                    .permute(0, 3, 1, 2)
-                    .contiguous()
-                    .to(dtype=torch.float32)
-                )
+                    video_frames = decode_to_frames(video_frames)
 
                 output_frames = (
                     video_frames if start_i == 0 else video_frames[cur_overlap:]
@@ -740,6 +862,10 @@ def main(
                 output_left = (
                     frames_left if start_i == 0 else frames_left[cur_overlap:]
                 )
+                # Crop back to original resolution after model inference at padded size.
+                if pad_h > 0 or pad_w > 0:
+                    output_frames = output_frames[:, :, :orig_height, :orig_width]
+                    output_left = output_left[:, :, :orig_height, :orig_width]
                 write_output_chunk(
                     sbs_writer,
                     anaglyph_writer,

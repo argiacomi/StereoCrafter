@@ -375,6 +375,7 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         return_dict: bool = True,
+        clip_image: Optional[torch.FloatTensor] = None,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -481,9 +482,12 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         self._guidance_scale = max_guidance_scale
         do_classifier_free_guidance = max(min_guidance_scale, max_guidance_scale) > 1.0
 
-        # 3. Encode input image
+        # 3. Encode input image for CLIP conditioning.
+        # When clip_image is provided, use it instead of frames[0:1] so that
+        # overlap-replaced frames don't drift the global conditioning signal.
+        clip_source = clip_image if clip_image is not None else frames[0:1]
         image_embeddings = self._encode_image(
-            frames[0:1],
+            clip_source,
             device,
             num_videos_per_prompt,
             do_classifier_free_guidance,
