@@ -33,6 +33,7 @@ from torch_runtime_utils import (
     is_torch_compile_failure,
     load_compile_artifacts,
     mark_torch_compile_step_begin,
+    resolve_compile_cache_dir,
     save_compile_artifacts,
 )
 
@@ -1088,14 +1089,15 @@ def main(
     track_time: bool = False,
     save_depth: bool = False,
     save_raw_sidecars: bool = True,
-    save_debug_video: bool = True,
+    save_debug_video: bool = False,
     compile_cache_dir: str = None,
     compile_warmup: bool = True,
 ):
     repo_root = Path(__file__).resolve().parent
-    compile_cache_dir = compile_cache_dir or os.environ.get(
-        "TORCHINDUCTOR_CACHE_DIR",
+    compile_cache_dir = resolve_compile_cache_dir(
+        compile_cache_dir,
         str(repo_root / ".torch_compile_cache" / "depth_splatting"),
+        "depth_splatting",
     )
     compile_cache_dir = configure_compile_cache(compile_cache_dir)
     compile_artifact_path = os.path.join(

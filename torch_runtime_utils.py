@@ -1,7 +1,12 @@
+import hashlib
 import os
+import pickle
 from pathlib import Path
 
 import torch
+
+
+COMPILE_ARTIFACT_MAGIC = "stereocrafter_torch_compile_artifacts_v1"
 
 
 def configure_cuda_performance_flags():
@@ -110,6 +115,85 @@ def configure_compile_cache(cache_dir):
     return str(cache_path)
 
 
+def resolve_compile_cache_dir(explicit_cache_dir, default_cache_dir, namespace):
+    if explicit_cache_dir:
+        return explicit_cache_dir
+
+    env_cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    if env_cache_dir:
+        env_cache_path = Path(env_cache_dir).expanduser()
+        if env_cache_path.name != namespace:
+            env_cache_path = env_cache_path / namespace
+        return str(env_cache_path)
+
+    return default_cache_dir
+
+
+def _delete_stale_compile_artifact(artifact_path, reason):
+    print(f"Ignoring torch.compile artifacts at {artifact_path}: {reason}")
+    try:
+        artifact_path.unlink()
+    except OSError:
+        pass
+
+
+def _unwrap_compile_artifacts(artifact_path, artifact_payload):
+    try:
+        record = pickle.loads(artifact_payload)
+    except Exception as exc:
+        _delete_stale_compile_artifact(
+            artifact_path,
+            "legacy or corrupt artifact wrapper "
+            f"({type(exc).__name__}: {exc}); rebuilding cache.",
+        )
+        return None
+
+    if not isinstance(record, dict) or record.get("magic") != COMPILE_ARTIFACT_MAGIC:
+        _delete_stale_compile_artifact(
+            artifact_path,
+            "unrecognized artifact format; rebuilding cache.",
+        )
+        return None
+
+    artifact_bytes = record.get("artifact_bytes")
+    artifact_len = record.get("artifact_len")
+    artifact_sha256 = record.get("artifact_sha256")
+    artifact_torch_version = record.get("torch_version")
+    if not isinstance(artifact_bytes, (bytes, bytearray)):
+        _delete_stale_compile_artifact(
+            artifact_path,
+            "artifact payload is missing compiled bytes; rebuilding cache.",
+        )
+        return None
+
+    artifact_bytes = bytes(artifact_bytes)
+    if artifact_len != len(artifact_bytes):
+        _delete_stale_compile_artifact(
+            artifact_path,
+            "artifact byte length does not match metadata; rebuilding cache.",
+        )
+        return None
+
+    digest = hashlib.sha256(artifact_bytes).hexdigest()
+    if artifact_sha256 != digest:
+        _delete_stale_compile_artifact(
+            artifact_path,
+            "artifact checksum mismatch; rebuilding cache.",
+        )
+        return None
+
+    current_torch_version = getattr(torch, "__version__", None)
+    if artifact_torch_version != current_torch_version:
+        _delete_stale_compile_artifact(
+            artifact_path,
+            "artifact was produced by a different torch version "
+            f"({artifact_torch_version!r} != {current_torch_version!r}); rebuilding cache.",
+        )
+        return None
+
+    return artifact_bytes
+
+
 def load_compile_artifacts(artifact_path):
     load_fn = getattr(getattr(torch, "compiler", None), "load_cache_artifacts", None)
     if load_fn is None:
@@ -128,10 +212,17 @@ def load_compile_artifacts(artifact_path):
     if not artifact_bytes:
         return False
 
+    artifact_bytes = _unwrap_compile_artifacts(artifact_path, artifact_bytes)
+    if artifact_bytes is None:
+        return False
+
     try:
         load_fn(artifact_bytes)
     except Exception as exc:
-        print(f"Failed to load torch.compile artifacts from {artifact_path}: {exc}")
+        _delete_stale_compile_artifact(
+            artifact_path,
+            f"load failed ({type(exc).__name__}: {exc}); rebuilding cache.",
+        )
         return False
 
     print(f"Loaded torch.compile artifacts from {artifact_path}.")
@@ -156,11 +247,22 @@ def save_compile_artifacts(artifact_path):
     if not artifact_bytes:
         return False
 
+    artifact_payload = pickle.dumps(
+        {
+            "magic": COMPILE_ARTIFACT_MAGIC,
+            "torch_version": getattr(torch, "__version__", None),
+            "artifact_len": len(artifact_bytes),
+            "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            "artifact_bytes": artifact_bytes,
+        },
+        protocol=pickle.HIGHEST_PROTOCOL,
+    )
+
     artifact_path = Path(artifact_path)
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = artifact_path.with_suffix(artifact_path.suffix + ".tmp")
     try:
-        temp_path.write_bytes(artifact_bytes)
+        temp_path.write_bytes(artifact_payload)
         temp_path.replace(artifact_path)
     except OSError as exc:
         try:
@@ -172,6 +274,6 @@ def save_compile_artifacts(artifact_path):
 
     print(
         f"Saved torch.compile artifacts to {artifact_path} "
-        f"({len(artifact_bytes) / 1024:.1f} KiB)."
+        f"({len(artifact_payload) / 1024:.1f} KiB)."
     )
     return True
