@@ -87,6 +87,65 @@ def max_supported_tile_num(height, width, tile_overlap=(128, 128)):
         tile_num += 1
 
 
+def ceil_to_multiple(value, multiple):
+    value = int(value)
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def compute_processing_geometry(original_height, original_width, max_res, align=128):
+    if max_res is None:
+        content_height = int(original_height)
+        content_width = int(original_width)
+    else:
+        if max_res < align:
+            raise ValueError(
+                f"max_res must be at least {align} so frames can be aligned to {align}, "
+                f"got {max_res}."
+            )
+        max_aligned_res = (int(max_res) // align) * align
+        if max_aligned_res < align:
+            raise ValueError(
+                f"max_res={max_res} rounds below the required {align}-pixel alignment."
+            )
+        scale = min(1.0, max_aligned_res / max(original_height, original_width))
+        content_height = max(
+            1, min(int(round(original_height * scale)), max_aligned_res)
+        )
+        content_width = max(
+            1, min(int(round(original_width * scale)), max_aligned_res)
+        )
+
+    model_height = ceil_to_multiple(content_height, align)
+    model_width = ceil_to_multiple(content_width, align)
+    return content_height, content_width, model_height, model_width
+
+
+def build_frame_sampling(num_frames, src_fps, target_fps):
+    if num_frames < 1:
+        raise ValueError(f"Expected at least one frame, but got {num_frames}.")
+    if src_fps <= 0:
+        raise ValueError(f"Expected a positive source FPS, but got {src_fps}.")
+
+    if target_fps in (None, -1):
+        return list(range(num_frames)), float(src_fps)
+    if target_fps <= 0:
+        raise ValueError(
+            f"target_fps must be -1 (keep source) or a positive number, got {target_fps}."
+        )
+    if target_fps >= src_fps:
+        return list(range(num_frames)), float(src_fps)
+
+    duration = (num_frames - 1) / src_fps if num_frames > 1 else 0.0
+    num_target = max(1, int(duration * target_fps) + 1)
+    frame_indices = []
+    for i in range(num_target):
+        t = i / target_fps
+        src_idx = min(int(t * src_fps + 0.5), num_frames - 1)
+        if not frame_indices or src_idx != frame_indices[-1]:
+            frame_indices.append(src_idx)
+    return frame_indices, float(target_fps)
+
+
 def blend_h(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor:
     weight_b = (torch.arange(overlap_size).view(1, 1, 1, -1) / overlap_size).to(
         b.device
@@ -498,46 +557,104 @@ def _pad_to_model_res(tensor, pad_h, pad_w):
     return tensor
 
 
-def load_inpainting_chunk(video_reader, start, stop, orig_height, orig_width, pad_h, pad_w):
+def resize_inpainting_inputs(
+    frames_warpped,
+    frames_left,
+    frames_mask,
+    target_height,
+    target_width,
+):
+    target_size = (int(target_height), int(target_width))
+    if frames_left.shape[-2:] == target_size:
+        return frames_warpped, frames_left, frames_mask
+
+    frames_left = torch.nn.functional.interpolate(
+        frames_left, size=target_size, mode="area"
+    )
+    frames_warpped = torch.nn.functional.interpolate(
+        frames_warpped, size=target_size, mode="area"
+    )
+    frames_mask = torch.nn.functional.interpolate(
+        frames_mask, size=target_size, mode="area"
+    ).clamp_(0, 1)
+    return frames_warpped, frames_left, frames_mask
+
+
+def load_inpainting_chunk(
+    video_reader,
+    frame_indices,
+    source_height,
+    source_width,
+    target_height,
+    target_width,
+    pad_h,
+    pad_w,
+):
     """Legacy loader: parse the 2x2 debug-grid MP4 into left/mask/warped, then pad."""
-    frames = video_reader.get_batch(list(range(start, stop))).asnumpy()
+    frames = video_reader.get_batch([int(idx) for idx in frame_indices]).asnumpy()
     frames = torch.from_numpy(frames).permute(0, 3, 1, 2).contiguous().float()
-    frames = frames[:, :, : orig_height * 2, : orig_width * 2]
+    frames = frames[:, :, : source_height * 2, : source_width * 2]
     frames = frames / 255.0
 
-    frames_left = frames[:, :, :orig_height, :orig_width]
-    frames_mask = frames[:, :, orig_height : orig_height * 2, :orig_width]
-    frames_warpped = frames[:, :, orig_height : orig_height * 2, orig_width : orig_width * 2]
+    frames_left = frames[:, :, :source_height, :source_width]
+    frames_mask = frames[:, :, source_height : source_height * 2, :source_width]
+    frames_warpped = frames[
+        :, :, source_height : source_height * 2, source_width : source_width * 2
+    ]
     frames_mask = frames_mask.mean(dim=1, keepdim=True)
 
+    frames_warpped, frames_left, frames_mask = resize_inpainting_inputs(
+        frames_warpped,
+        frames_left,
+        frames_mask,
+        target_height,
+        target_width,
+    )
     frames_left = _pad_to_model_res(frames_left, pad_h, pad_w)
     frames_warpped = _pad_to_model_res(frames_warpped, pad_h, pad_w)
     frames_mask = _pad_to_model_res(frames_mask, pad_h, pad_w)
     return frames_warpped, frames_left, frames_mask
 
 
-def load_inpainting_chunk_raw(mmap_left, mmap_right, mmap_mask, start, stop, pad_h, pad_w):
+def load_inpainting_chunk_raw(
+    mmap_left,
+    mmap_right,
+    mmap_mask,
+    frame_indices,
+    target_height,
+    target_width,
+    pad_h,
+    pad_w,
+):
     """Loader for compact memmap arrays written by the splatting stage.
 
     Supports both legacy float32 sidecars and the newer compact layout
     (uint8 left/mask, float16 right).  Everything is promoted to float32
     tensors in [0, 1] for the inpainting pipeline.
     """
-    raw_left = np.array(mmap_left[start:stop], copy=True)
+    index_array = [int(idx) for idx in frame_indices]
+    raw_left = np.array(mmap_left[index_array], copy=True)
     if raw_left.dtype == np.uint8:
         raw_left = raw_left.astype(np.float32) / 255.0
     left = torch.from_numpy(raw_left).permute(0, 3, 1, 2).contiguous()
 
-    raw_right = np.array(mmap_right[start:stop], copy=True)
+    raw_right = np.array(mmap_right[index_array], copy=True)
     if raw_right.dtype != np.float32:
         raw_right = raw_right.astype(np.float32)
     right = torch.from_numpy(raw_right).permute(0, 3, 1, 2).contiguous()
 
-    raw_mask = np.array(mmap_mask[start:stop], copy=True)
+    raw_mask = np.array(mmap_mask[index_array], copy=True)
     if raw_mask.dtype == np.uint8:
         raw_mask = raw_mask.astype(np.float32) / 255.0
     mask = torch.from_numpy(raw_mask).permute(0, 3, 1, 2).contiguous()
 
+    right, left, mask = resize_inpainting_inputs(
+        right,
+        left,
+        mask,
+        target_height,
+        target_width,
+    )
     left = _pad_to_model_res(left, pad_h, pad_w)
     right = _pad_to_model_res(right, pad_h, pad_w)
     mask = _pad_to_model_res(mask, pad_h, pad_w)
@@ -591,6 +708,8 @@ def main(
     num_inference_steps=8,
     decode_chunk_size=None,
     vae_encode_chunk_size=None,
+    target_fps=-1,
+    max_res=None,
     noise_aug_strength=0.0,
     final_video_codec=None,
     final_video_preset="medium",
@@ -712,8 +831,8 @@ def main(
             mmap_left = np.load(str(raw_meta["left_path"]), mmap_mode="r")
             mmap_right = np.load(str(raw_meta["right_path"]), mmap_mode="r")
             mmap_mask = np.load(str(raw_meta["mask_path"]), mmap_mode="r")
-            fps = float(raw_meta["fps"])
-            num_frames = int(raw_meta["num_frames"])
+            source_fps = float(raw_meta["fps"])
+            source_num_frames = int(raw_meta["num_frames"])
             raw_height = int(raw_meta["height"])
             raw_width = int(raw_meta["width"])
             video_reader = None
@@ -734,8 +853,8 @@ def main(
         mmap_left = mmap_right = mmap_mask = None
         raw_height = raw_width = None
         video_reader = VideoReader(input_video_path, ctx=cpu(0))
-        fps = video_reader.get_avg_fps()
-        num_frames = len(video_reader)
+        source_fps = float(video_reader.get_avg_fps())
+        source_num_frames = len(video_reader)
         video_name = (
             input_video_path.split("/")[-1]
             .replace(".mp4", "")
@@ -743,26 +862,39 @@ def main(
             + "_inpainting_results"
         )
 
-    # Pad to next 128-multiple instead of cropping, so we don't lose border pixels.
-    # The model output is cropped back to orig_height x orig_width before writing.
-    def _ceil128(x):
-        return ((x + 127) // 128) * 128
-
     if use_raw:
-        orig_height, orig_width = raw_height, raw_width
+        source_height, source_width = raw_height, raw_width
     else:
         sample_frame = video_reader[0].asnumpy()
-        orig_height = sample_frame.shape[0] // 2
-        orig_width = sample_frame.shape[1] // 2
+        source_height = sample_frame.shape[0] // 2
+        source_width = sample_frame.shape[1] // 2
 
-    height = _ceil128(orig_height)
-    width = _ceil128(orig_width)
-    if orig_height == 0 or orig_width == 0:
+    if source_height == 0 or source_width == 0:
         raise ValueError(
-            f"Input video is too small: derived output size is {(orig_height, orig_width)}."
+            f"Input video is too small: derived output size is {(source_height, source_width)}."
         )
-    pad_h = height - orig_height
-    pad_w = width - orig_width
+
+    frame_indices, fps = build_frame_sampling(source_num_frames, source_fps, target_fps)
+    num_frames = len(frame_indices)
+    if num_frames <= overlap:
+        raise ValueError(
+            "Inpainting has too few sampled frames for the requested overlap: "
+            f"sampled_frames={num_frames}, overlap={overlap}. "
+            "Increase target_fps or lower overlap."
+        )
+    content_height, content_width, height, width = compute_processing_geometry(
+        source_height, source_width, max_res, align=128
+    )
+    pad_h = height - content_height
+    pad_w = width - content_width
+
+    print(
+        "Inpainting processing plan: "
+        f"frames={num_frames}/{source_num_frames}, "
+        f"fps={fps:.2f}/{source_fps:.2f}, "
+        f"content={(content_height, content_width)}, "
+        f"model_input={(height, width)}"
+    )
 
     max_tile_num = max_supported_tile_num(height, width)
     if tile_num > max_tile_num:
@@ -779,9 +911,11 @@ def main(
     anaglyph_write_path, anaglyph_final_path = prepare_output_path(
         vid_anaglyph_path, final_video_codec
     )
-    sbs_writer = create_video_writer(sbs_write_path, fps, orig_width * 2, orig_height)
+    sbs_writer = create_video_writer(
+        sbs_write_path, fps, content_width * 2, content_height
+    )
     anaglyph_writer = create_video_writer(
-        anaglyph_write_path, fps, orig_width, orig_height
+        anaglyph_write_path, fps, content_width, content_height
     )
 
     generated_context = None
@@ -1094,21 +1228,32 @@ def main(
                     f"({warmup_info['frame_count']} frames)."
                 )
                 if use_raw:
+                    warmup_frame_indices = frame_indices[
+                        warmup_info["cur_i"] : warmup_info["stop_i"]
+                    ]
                     warmup_frames_warpped, warmup_frames_left, warmup_frames_mask = (
                         load_inpainting_chunk_raw(
-                            mmap_left, mmap_right, mmap_mask,
-                            warmup_info["cur_i"], warmup_info["stop_i"],
+                            mmap_left,
+                            mmap_right,
+                            mmap_mask,
+                            warmup_frame_indices,
+                            content_height,
+                            content_width,
                             pad_h, pad_w,
                         )
                     )
                 else:
+                    warmup_frame_indices = frame_indices[
+                        warmup_info["cur_i"] : warmup_info["stop_i"]
+                    ]
                     warmup_frames_warpped, warmup_frames_left, warmup_frames_mask = (
                         load_inpainting_chunk(
                             video_reader,
-                            warmup_info["cur_i"],
-                            warmup_info["stop_i"],
-                            orig_height,
-                            orig_width,
+                            warmup_frame_indices,
+                            source_height,
+                            source_width,
+                            content_height,
+                            content_width,
                             pad_h,
                             pad_w,
                         )
@@ -1137,19 +1282,27 @@ def main(
                     video_frames = warmed_chunk[2]
                     warmed_chunk = None
                 else:
+                    chunk_frame_indices = frame_indices[
+                        chunk_info["cur_i"] : chunk_info["stop_i"]
+                    ]
                     if use_raw:
                         frames_warpped, frames_left, frames_mask = load_inpainting_chunk_raw(
-                            mmap_left, mmap_right, mmap_mask,
-                            chunk_info["cur_i"], chunk_info["stop_i"],
+                            mmap_left,
+                            mmap_right,
+                            mmap_mask,
+                            chunk_frame_indices,
+                            content_height,
+                            content_width,
                             pad_h, pad_w,
                         )
                     else:
                         frames_warpped, frames_left, frames_mask = load_inpainting_chunk(
                             video_reader,
-                            chunk_info["cur_i"],
-                            chunk_info["stop_i"],
-                            orig_height,
-                            orig_width,
+                            chunk_frame_indices,
+                            source_height,
+                            source_width,
+                            content_height,
+                            content_width,
                             pad_h,
                             pad_w,
                         )
@@ -1206,8 +1359,10 @@ def main(
                 )
                 # Crop back to original resolution after model inference at padded size.
                 if pad_h > 0 or pad_w > 0:
-                    output_frames = output_frames[:, :, :orig_height, :orig_width]
-                    output_left = output_left[:, :, :orig_height, :orig_width]
+                    output_frames = output_frames[
+                        :, :, :content_height, :content_width
+                    ]
+                    output_left = output_left[:, :, :content_height, :content_width]
                 write_output_chunk(
                     sbs_writer,
                     anaglyph_writer,

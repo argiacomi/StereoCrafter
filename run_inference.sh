@@ -13,6 +13,11 @@ python inpainting_inference.py \
     --save_dir ./outputs \
     --tile_num 2
 
+# Faster stage-2 fallback for long/high-FPS videos:
+#     --target_fps 12 \
+#     --max_res 768 \
+#     --num_inference_steps 4 \
+#
 # Optional final delivery transcode via ffmpeg:
 #     --final_video_codec libx264 \
 #     --final_video_preset medium \
