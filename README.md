@@ -56,6 +56,10 @@ cd StereoCrafter
 pip install -r requirements.txt
 ```
 
+Optional: install `ffmpeg` only if you plan to enable final delivery transcoding
+with `--final_video_codec` during stage 2. The default workflow does not require
+it.
+
 
 #### 4. Install customized 'Forward-Warp' package for forward splatting
 ```
@@ -138,6 +142,7 @@ python inpainting_inference.py \
     --unet_path [PATH] \
     --input_video_path [PATH] \
     --save_dir [PATH] \
+    --final_video_codec [CODEC] \
     --compile_cache_dir [PATH]
 ```
 Arguments:
@@ -148,10 +153,15 @@ Arguments:
 - `--tile_num`: The number of tiles in width and height dimensions for tiled processing, which allows for handling high resolution input without requiring more GPU memory. The default value is `1` (1 $\times$ 1 tile). For input videos with a resolution of 2K or higher, you could use more tiles to avoid running out of memory.
 - `--decode_chunk_size`: The number of frames to decode through the inpainting VAE at once. Lower values reduce peak GPU memory and can avoid unstable compiled-decoder paths during VAE decode. The default value is `frames_chunk`.
 - `--vae_encode_chunk_size`: The number of frames to encode through the inpainting VAE at once. Lower values reduce peak GPU memory during VAE encoding when spatial tiling alone is not enough. The default value is `5`.
+- `--final_video_codec`: Optional `ffmpeg` codec used to transcode the final SBS/anaglyph deliverables after the reliable OpenCV `mp4v` write completes. Recommended value is `libx264`. Default is disabled, including in the checked-in helper script.
+- `--final_video_preset`: `ffmpeg` preset used when `--final_video_codec` is `libx264` or `libx265`. Default is `medium`.
+- `--final_video_crf`: `ffmpeg` CRF used when `--final_video_codec` is `libx264` or `libx265`. Lower is higher quality. Default is `18`.
 - `--compile_cache_dir`: Optional persistent `torch.compile` cache directory. Default is `./.torch_compile_cache/inpainting`.
 - `--compile_warmup`: Warm up the canonical inpainting chunk shape before the main loop and reuse it. Default is `True`.
 
 Inpainting keeps `torch.compile` on the dominant full-size chunk shape and runs undersized tail chunks eagerly to avoid a second recompilation/autotuning pass.
+
+For maximum compatibility inside constrained containers, OpenCV still writes with `mp4v` internally. If `--final_video_codec libx264` is enabled, StereoCrafter writes temporary `_opencv.mp4` files and then lets `ffmpeg` transcode the final deliverables.
 
 The stereo video inpainting generates the stereo video result in side-by-side format and anaglyph 3D format, as shown below:
 

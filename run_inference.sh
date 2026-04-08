@@ -12,3 +12,8 @@ python inpainting_inference.py \
     --input_video_path ./outputs/camel_splatting_results.mp4 \
     --save_dir ./outputs \
     --tile_num 2
+
+# Optional final delivery transcode via ffmpeg:
+#     --final_video_codec libx264 \
+#     --final_video_preset medium \
+#     --final_video_crf 18

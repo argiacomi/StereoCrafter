@@ -1,5 +1,8 @@
 import gc
 import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -202,8 +205,20 @@ def spatial_tiled_process(
 
 
 def create_video_writer(output_video_path, fps, width, height):
-    """Create a VideoWriter preferring HEVC, falling back to mp4v."""
-    for codec in ("HEVC", "mp4v"):
+    """Create a VideoWriter using a codec order tuned for reliability.
+
+    Default to mp4v so OpenCV does not spam stderr on hosts without an HEVC
+    encoder. Override with STEREOCRAFTER_VIDEO_CODECS=HEVC,mp4v if preferred.
+    """
+    codec_env = os.environ.get("STEREOCRAFTER_VIDEO_CODECS")
+    if codec_env:
+        codec_candidates = tuple(
+            codec.strip() for codec in codec_env.split(",") if codec.strip()
+        )
+    else:
+        codec_candidates = ("mp4v", "HEVC")
+
+    for codec in codec_candidates:
         writer = cv2.VideoWriter(
             output_video_path,
             cv2.VideoWriter_fourcc(*codec),
@@ -214,8 +229,177 @@ def create_video_writer(output_video_path, fps, width, height):
             return writer
         writer.release()
     raise RuntimeError(
-        f"Failed to open VideoWriter for {output_video_path} with any codec."
+        f"Failed to open VideoWriter for {output_video_path} with codecs {codec_candidates}."
     )
+
+
+def normalize_final_video_codec(codec):
+    if codec is None:
+        return None
+
+    codec = str(codec).strip()
+    if not codec:
+        return None
+
+    if codec.lower() in {"none", "off", "false", "disable", "disabled", "mp4v"}:
+        return None
+
+    return codec
+
+
+def prepare_output_path(output_video_path, final_video_codec):
+    codec = normalize_final_video_codec(final_video_codec)
+    if codec is None:
+        return output_video_path, None
+
+    output_path = Path(output_video_path)
+    temp_output_path = output_path.with_name(
+        f"{output_path.stem}_opencv{output_path.suffix}"
+    )
+    return str(temp_output_path), str(output_path)
+
+
+def build_final_video_ffmpeg_command(
+    ffmpeg_path,
+    input_args,
+    output_video_path,
+    final_video_codec,
+    final_video_preset,
+    final_video_crf,
+):
+    codec = normalize_final_video_codec(final_video_codec)
+    if codec is None:
+        raise ValueError("final_video_codec must be enabled to build an ffmpeg command.")
+
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *input_args,
+        "-an",
+        "-c:v",
+        codec,
+    ]
+    if codec in {"libx264", "libx265"}:
+        command.extend(
+            [
+                "-preset",
+                final_video_preset,
+                "-crf",
+                str(final_video_crf),
+                "-pix_fmt",
+                "yuv420p",
+                "-vf",
+                "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            ]
+        )
+    command.extend(["-movflags", "+faststart", output_video_path])
+    return command
+
+
+def validate_final_video_transcode(
+    final_video_codec, final_video_preset, final_video_crf
+):
+    codec = normalize_final_video_codec(final_video_codec)
+    if codec is None:
+        return
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError(
+            f"`final_video_codec={codec}` requires ffmpeg on PATH, but ffmpeg was not found."
+        )
+
+    with tempfile.TemporaryDirectory(prefix="stereocrafter_ffmpeg_probe_") as temp_dir:
+        probe_output_path = os.path.join(temp_dir, "probe.mp4")
+        command = build_final_video_ffmpeg_command(
+            ffmpeg_path,
+            [
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=32x32:r=1",
+                "-frames:v",
+                "1",
+            ],
+            probe_output_path,
+            codec,
+            final_video_preset,
+            final_video_crf,
+        )
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip()
+            raise RuntimeError(
+                "The requested final video transcode settings failed validation before "
+                f"inference started: codec={codec}, preset={final_video_preset}, "
+                f"crf={final_video_crf}. ffmpeg stderr: {stderr or 'n/a'}"
+            ) from exc
+
+
+def transcode_output_video(
+    input_video_path,
+    output_video_path,
+    final_video_codec,
+    final_video_preset,
+    final_video_crf,
+):
+    codec = normalize_final_video_codec(final_video_codec)
+    if codec is None or output_video_path is None:
+        return
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError(
+            f"`final_video_codec={codec}` requires ffmpeg on PATH, but ffmpeg was not found."
+        )
+
+    output_path = Path(output_video_path)
+    temp_output_path = str(
+        output_path.with_name(f"{output_path.stem}_ffmpeg_tmp{output_path.suffix}")
+    )
+    command = build_final_video_ffmpeg_command(
+        ffmpeg_path,
+        ["-i", input_video_path],
+        temp_output_path,
+        codec,
+        final_video_preset,
+        final_video_crf,
+    )
+
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        try:
+            os.remove(temp_output_path)
+        except OSError:
+            pass
+        stderr = (exc.stderr or "").strip()
+        raise RuntimeError(
+            "ffmpeg failed to transcode the final video "
+            f"{input_video_path} -> {output_video_path} with codec {codec}. "
+            f"Temporary mp4v output was kept at {input_video_path}. "
+            f"ffmpeg stderr: {stderr or 'n/a'}"
+        ) from exc
+
+    os.replace(temp_output_path, output_video_path)
+    try:
+        os.remove(input_video_path)
+    except OSError:
+        pass
 
 
 def write_video_chunk(writer, input_frames):
@@ -325,6 +509,9 @@ def main(
     decode_chunk_size=None,
     vae_encode_chunk_size=None,
     noise_aug_strength=0.0,
+    final_video_codec=None,
+    final_video_preset="medium",
+    final_video_crf=18,
     cpu_offload=None,
     compile_cache_dir=None,
     compile_warmup=True,
@@ -349,6 +536,10 @@ def main(
         )
     if tile_num < 1:
         raise ValueError(f"`tile_num` must be at least 1, but got {tile_num}.")
+    if final_video_crf < 0:
+        raise ValueError(
+            f"`final_video_crf` must be non-negative, but got {final_video_crf}."
+        )
     if decode_chunk_size is not None and decode_chunk_size < 1:
         raise ValueError(
             f"`decode_chunk_size` must be at least 1, but got {decode_chunk_size}."
@@ -358,6 +549,9 @@ def main(
             "`vae_encode_chunk_size` must be at least 1, "
             f"but got {vae_encode_chunk_size}."
         )
+    validate_final_video_transcode(
+        final_video_codec, final_video_preset, final_video_crf
+    )
 
     decode_chunk_size = min(decode_chunk_size or frames_chunk, frames_chunk)
 
@@ -496,8 +690,16 @@ def main(
 
     frames_sbs_path = os.path.join(save_dir, f"{video_name}_sbs.mp4")
     vid_anaglyph_path = os.path.join(save_dir, f"{video_name}_anaglyph.mp4")
-    sbs_writer = create_video_writer(frames_sbs_path, fps, orig_width * 2, orig_height)
-    anaglyph_writer = create_video_writer(vid_anaglyph_path, fps, orig_width, orig_height)
+    sbs_write_path, sbs_final_path = prepare_output_path(
+        frames_sbs_path, final_video_codec
+    )
+    anaglyph_write_path, anaglyph_final_path = prepare_output_path(
+        vid_anaglyph_path, final_video_codec
+    )
+    sbs_writer = create_video_writer(sbs_write_path, fps, orig_width * 2, orig_height)
+    anaglyph_writer = create_video_writer(
+        anaglyph_write_path, fps, orig_width, orig_height
+    )
 
     generated_context = None
     step = frames_chunk - overlap
@@ -776,6 +978,7 @@ def main(
             if restore_compiled_vae_decoder and compiled_vae_decoder_available:
                 pipeline.vae.decoder = compiled_vae_decoder
 
+    inpainting_succeeded = False
     try:
         with torch.inference_mode():
             pipeline.set_progress_bar_config(disable=True)
@@ -913,10 +1116,32 @@ def main(
 
                 context_size = min(frames_chunk - 1, video_frames.shape[0])
                 generated_context = video_frames[-context_size:].clone()
+        inpainting_succeeded = True
     finally:
         sbs_writer.release()
         anaglyph_writer.release()
+        transcode_error = None
+        if inpainting_succeeded:
+            try:
+                transcode_output_video(
+                    sbs_write_path,
+                    sbs_final_path,
+                    final_video_codec,
+                    final_video_preset,
+                    final_video_crf,
+                )
+                transcode_output_video(
+                    anaglyph_write_path,
+                    anaglyph_final_path,
+                    final_video_codec,
+                    final_video_preset,
+                    final_video_crf,
+                )
+            except Exception as exc:
+                transcode_error = exc
         save_compile_artifacts(compile_artifact_path)
+        if transcode_error is not None:
+            raise transcode_error
 
 
 if __name__ == "__main__":

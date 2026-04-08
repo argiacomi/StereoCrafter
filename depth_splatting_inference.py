@@ -242,8 +242,20 @@ def shrink_temporal_window(window_size, overlap):
 
 
 def create_video_writer(output_video_path, fps, width, height):
-    """Create a VideoWriter preferring HEVC, falling back to mp4v."""
-    for codec in ("HEVC", "mp4v"):
+    """Create a VideoWriter using a codec order tuned for reliability.
+
+    Default to mp4v so OpenCV does not spam stderr on hosts without an HEVC
+    encoder. Override with STEREOCRAFTER_VIDEO_CODECS=HEVC,mp4v if preferred.
+    """
+    codec_env = os.environ.get("STEREOCRAFTER_VIDEO_CODECS")
+    if codec_env:
+        codec_candidates = tuple(
+            codec.strip() for codec in codec_env.split(",") if codec.strip()
+        )
+    else:
+        codec_candidates = ("mp4v", "HEVC")
+
+    for codec in codec_candidates:
         writer = cv2.VideoWriter(
             output_video_path,
             cv2.VideoWriter_fourcc(*codec),
@@ -254,7 +266,7 @@ def create_video_writer(output_video_path, fps, width, height):
             return writer
         writer.release()
     raise RuntimeError(
-        f"Failed to open VideoWriter for {output_video_path} with any codec."
+        f"Failed to open VideoWriter for {output_video_path} with codecs {codec_candidates}."
     )
 
 
