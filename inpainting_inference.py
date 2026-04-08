@@ -204,6 +204,89 @@ def spatial_tiled_process(
     return torch.cat(row_strips, dim=2)
 
 
+def spatial_tiled_decode_latents(
+    latents,
+    pipeline,
+    tile_num,
+    decode_chunk_size,
+    image_height,
+    image_width,
+    tile_overlap=(128, 128),
+):
+    """Decode latents in overlapping spatial tiles to bound VAE decoder memory."""
+    if tile_num < 1:
+        raise ValueError(f"`tile_num` must be at least 1, but got {tile_num}.")
+
+    if tile_num == 1:
+        return pipeline.decode_latents(
+            latents,
+            num_frames=latents.shape[1],
+            decode_chunk_size=decode_chunk_size,
+        )
+
+    tile_size, tile_stride = spatial_tile_shape(
+        image_height, image_width, tile_num, tile_overlap
+    )
+    if tile_stride[0] <= 0 or tile_stride[1] <= 0:
+        raise ValueError(
+            f"`tile_num={tile_num}` is too large for frame size {(image_height, image_width)} "
+            f"with tile overlap {tile_overlap}."
+        )
+
+    latent_tile_size = (
+        tile_size[0] // pipeline.vae_scale_factor,
+        tile_size[1] // pipeline.vae_scale_factor,
+    )
+    latent_stride = (
+        tile_stride[0] // pipeline.vae_scale_factor,
+        tile_stride[1] // pipeline.vae_scale_factor,
+    )
+
+    prev_row = None
+    row_strips = []
+    for i in range(tile_num):
+        cur_row = []
+        for j in range(tile_num):
+            latent_tile = latents[
+                :,
+                :,
+                :,
+                i * latent_stride[0] : i * latent_stride[0] + latent_tile_size[0],
+                j * latent_stride[1] : j * latent_stride[1] + latent_tile_size[1],
+            ]
+            decoded_tile = pipeline.decode_latents(
+                latent_tile,
+                num_frames=latent_tile.shape[1],
+                decode_chunk_size=decode_chunk_size,
+            )
+            decoded_tile = (
+                decoded_tile[0].permute(1, 0, 2, 3).contiguous()
+            )  # [F, C, H, W]
+
+            if prev_row is not None:
+                decoded_tile = blend_v(prev_row[j], decoded_tile, tile_overlap[0])
+            if j > 0:
+                decoded_tile = blend_h(cur_row[j - 1], decoded_tile, tile_overlap[1])
+
+            cur_row.append(decoded_tile)
+
+        trimmed = []
+        for j, decoded_tile in enumerate(cur_row):
+            if j < tile_num - 1:
+                decoded_tile = decoded_tile[:, :, :, : tile_stride[1]]
+            trimmed.append(decoded_tile)
+        row_strip = torch.cat(trimmed, dim=3)
+
+        if i < tile_num - 1:
+            row_strip = row_strip[:, :, : tile_stride[0], :]
+
+        row_strips.append(row_strip)
+        prev_row = cur_row
+
+    decoded_frames = torch.cat(row_strips, dim=2)
+    return decoded_frames.permute(1, 0, 2, 3).unsqueeze(0).contiguous()
+
+
 def create_video_writer(output_video_path, fps, width, height):
     """Create a VideoWriter using a codec order tuned for reliability.
 
@@ -705,6 +788,7 @@ def main(
     step = frames_chunk - overlap
     current_tile_num = tile_num
     current_decode_chunk_size = decode_chunk_size
+    current_decode_tile_num = 1
     current_vae_encode_chunk_size = max(1, int(vae_encode_chunk_size or 5))
     chunk_infos = []
     for chunk_index, start_i in enumerate(range(0, num_frames, step)):
@@ -746,6 +830,7 @@ def main(
         nonlocal compiled_unet_available
         nonlocal compiled_vae_decoder_available
         nonlocal current_decode_chunk_size
+        nonlocal current_decode_tile_num
         nonlocal current_tile_num
         nonlocal current_vae_encode_chunk_size
         nonlocal math_sdpa_forced
@@ -903,10 +988,13 @@ def main(
                 try:
                     if use_compiled_vae_decoder:
                         mark_torch_compile_step_begin()
-                    video_frames = pipeline.decode_latents(
+                    video_frames = spatial_tiled_decode_latents(
                         video_latents,
-                        num_frames=video_latents.shape[1],
+                        pipeline,
+                        tile_num=current_decode_tile_num,
                         decode_chunk_size=current_decode_chunk_size,
+                        image_height=input_frames_i.shape[2],
+                        image_width=input_frames_i.shape[3],
                     )
                     return video_frames
                 except Exception as exc:
@@ -963,6 +1051,19 @@ def main(
                                 f"retrying with decode_chunk_size={next_decode_chunk_size}."
                             )
                             current_decode_chunk_size = next_decode_chunk_size
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+
+                        if current_decode_tile_num < max_tile_num:
+                            next_decode_tile_num = current_decode_tile_num + 1
+                            print(
+                                "Inpainting hit CUDA OOM after exhausting "
+                                "VAE decode chunk retries; "
+                                f"retrying with decode_tile_num={next_decode_tile_num}."
+                            )
+                            current_decode_tile_num = next_decode_tile_num
                             gc.collect()
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
